@@ -1,6 +1,7 @@
 
 
-<img width="1318" height="828" alt="Screenshot" src="https://github.com/user-attachments/assets/4342f848-fcd6-4e68-8888-19d57c84bc4a" />
+<img width="1421" height="940" alt="Bildschirmfoto 2026-07-05 um 21 27 58" src="https://github.com/user-attachments/assets/a93fed61-ffe4-4d24-9d21-e94e6f77b16b" />
+
 
 
 # AIPhotoManager
