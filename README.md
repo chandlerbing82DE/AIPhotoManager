@@ -35,9 +35,23 @@ An advanced, AI-powered local photo management application built natively for ma
 - **Database**: SwiftData with concurrent worker mapping (`actor ScannerService`), background `ModelContext` batching to prevent RAM memory exhaustion, and cascading lifecycle delete rules.
 - **AI Backend Gateway**: Built-in multipart runner connecting to local sub-processes (`Process()`) and isolated URLSession network tasks for external cloud engines.
 
-## 📦 Prerequisites & Local Engine
+## 📦 Prerequisites & Local AI Engine Installation
 
-The project relies on a standalone binary or Python backend named `face_server` placed inside the application bundle resources. This server listens on `http://127.0.0.1:8000` to execute deep learning models locally for facial embedding extraction.
+> ⚠️ **Repository Exclusion Notice**: Due to GitHub's file size limits (>25MB for web / >100MB for Git CLI), the pre-compiled Python binary `face_server` (responsible for offline facial recognition and biometric vector embeddings) is **excluded from this repository via `.gitignore`**. You must download it separately from the **Releases** tab.
+
+### Installation Instructions:
+1. Navigate to the **Releases** section on the right side of this GitHub repository page.
+2. Download the `face_server.zip` asset from the latest release.
+3. Extract the ZIP archive to obtain the standalone executable file named `face_server`.
+4. Open this project in **Xcode**.
+5. Drag and drop the `face_server` binary directly into your Xcode project structure under the `AIPhotoManager` folder.
+6. In the Xcode dialog prompt, make sure to check:
+   - **"Copy items if needed"**
+   - **"Create folder references"** (or Groups)
+   - Ensure it is checked under **Targets** -> **AIPhotoManager**.
+7. Verify under **Project Settings** -> **Build Phases** -> **Copy Bundle Resources** that `face_server` is correctly listed.
+
+*Note: Because this binary is compiled locally without an Apple Developer certificate, macOS Gatekeeper may block it on the first launch. If this occurs, navigate to macOS System Settings -> Privacy & Security and click "Allow Anyway" for `face_server`.*
 
 ## 📄 License & Terms of Use
 
@@ -70,9 +84,23 @@ This project is open-source. You are completely free to modify, alter, share, an
 - **Baza Danych**: SwiftData z wielowątkowym przetwarzaniem wewnątrz bezpiecznego kontekstu aktora (`actor ScannerService`), wykorzystująca technikę wsadowego zapisu (batching) w celu optymalizacji pamięci RAM przy operacjach masowych.
 - **Wsparcie Tła**: Zarządzanie procesami systemowymi za pośrednictwem `Process()` i blokad aktywności tła (`beginActivity`) zapobiegających usypianiu systemu w trakcie ciężkich analiz fotografii.
 
-## 📦 Wymagania i Silnik Lokalny
+## 📦 Wymagania i Instalacja Lokalnego Silnika AI
 
-Do poprawnego działania modułu rozpoznawania twarzy aplikacja wymaga skompilowanego pliku wykonywalnego lub skryptu Pythona o nazwie `face_server`, umieszczonego w zasobach pakietu (Bundle Resources). Serwer ten operuje na porcie `127.0.0.1:8000` i odpowiada za bezchmurową ekstrakcję cech biomorficznych twarzy.
+> ⚠️ **Uwaga dotycząca rozmiaru plików**: Ze względu na rygorystyczne limity rozmiaru plików na platformie GitHub (>25MB dla przeglądarki / >100MB dla systemu Git CLI), skompilowany binarnie silnik Pythona `face_server` (odpowiedzialny za bezchmurowe rozpoznawanie twarzy i wektoryzację cech biometrycznych) **został wykluczony z repozytorium kodu za pomocą pliku `.gitignore`**. Należy pobrać go osobno z zakładki **Releases**.
+
+### Instrukcja krok po kroku:
+1. Przejdź do sekcji **Releases** po prawej stronie głównej strony tego repozytorium GitHub.
+2. Pobierz paczkę `face_server.zip` przypisaną do najnowszego wydania.
+3. Rozpakuj pobrane archiwum ZIP na swoim komputerze, aby uzyskać samodzielny plik wykonywalny o nazwie `face_server`.
+4. Otwórz projekt aplikacji w środowisku **Xcode**.
+5. Przeciągnij rozpakowany plik wykonywalny `face_server` bezpośrednio do struktury plików projektu w Xcode, umieszczając go w folderze `AIPhotoManager`.
+6. W oknie dialogowym Xcode upewnij się, że zaznaczyłeś opcje:
+   - **"Copy items if needed"**
+   - **"Create groups"** (lub Folder references)
+   - Twój główny target docelowy: **AIPhotoManager**.
+7. Wejdź w ustawienia projektu -> **Build Phases** -> **Copy Bundle Resources** i upewnij się, że plik `face_server` znajduje się na liście zasobów.
+
+*Uwaga: Ponieważ plik binarny nie posiada podpisu cyfrowego zarejestrowanego dewelopera Apple, system macOS Gatekeeper zablokuje jego wykonanie przy pierwszym uruchomieniu. Należy wówczas wejść w Ustawienia systemowe -> Prywatność i bezpieczeństwo i kliknąć przycisk „Pozwól na uruchomienie” (Allow Anyway) dla procesu face_server.*
 
 ## 📄 Licencja i Warunki Użycia
 
