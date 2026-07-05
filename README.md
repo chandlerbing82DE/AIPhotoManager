@@ -1,3 +1,8 @@
+
+
+<img width="1318" height="828" alt="Screenshot" src="https://github.com/user-attachments/assets/4342f848-fcd6-4e68-8888-19d57c84bc4a" />
+
+
 # AIPhotoManager
 
 An advanced, AI-powered local photo management application built natively for macOS using **SwiftUI**, **SwiftData**, and **Google Gemini API**, integrated with a local Python-based face recognition engine.
