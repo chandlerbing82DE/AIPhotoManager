@@ -69,12 +69,13 @@ final class VirtualFolder {
     // NOWE: Funkcja rekursywna pobierająca zdjęcia z podfolderów
     func photosRecursively(limit: Int = 0) -> [PhotoAsset] {
         var allPhotos = self.photos
+        if limit > 0 && allPhotos.count >= limit { return Array(allPhotos.prefix(limit)) }
         for child in childFolders {
-            allPhotos.append(contentsOf: child.photosRecursively())
+            let needed = limit > 0 ? limit - allPhotos.count : 0
+            if limit > 0 && needed <= 0 { break }
+            allPhotos.append(contentsOf: child.photosRecursively(limit: needed))
         }
-        if limit > 0 && allPhotos.count > limit {
-            return Array(allPhotos.prefix(limit))
-        }
+        if limit > 0 && allPhotos.count > limit { return Array(allPhotos.prefix(limit)) }
         return allPhotos
     }
     
@@ -100,12 +101,13 @@ final class EventFolder {
     // NOWE: Funkcja rekursywna pobierająca zdjęcia z pod-wydarzeń
     func photosRecursively(limit: Int = 0) -> [PhotoAsset] {
         var allPhotos = self.photos
+        if limit > 0 && allPhotos.count >= limit { return Array(allPhotos.prefix(limit)) }
         for child in childEvents {
-            allPhotos.append(contentsOf: child.photosRecursively())
+            let needed = limit > 0 ? limit - allPhotos.count : 0
+            if limit > 0 && needed <= 0 { break }
+            allPhotos.append(contentsOf: child.photosRecursively(limit: needed))
         }
-        if limit > 0 && allPhotos.count > limit {
-            return Array(allPhotos.prefix(limit))
-        }
+        if limit > 0 && allPhotos.count > limit { return Array(allPhotos.prefix(limit)) }
         return allPhotos
     }
     

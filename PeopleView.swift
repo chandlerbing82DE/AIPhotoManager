@@ -169,8 +169,17 @@ struct PeopleView: View {
             
             let targets = allPeople.filter { $0.name.hasPrefix("Osoba ") }
             var deletedCount = 0
+            var affectedPhotoIDs: Set<PersistentIdentifier> = []
             
             for p in targets {
+                // Zbieramy ID zdjęć powiązanych z tą osobą z obu źródeł:
+                // twarzy (FaceCrop.photo) i relacji (Person.photos)
+                for crop in p.faceCrops {
+                    if let photoId = crop.photo?.persistentModelID { affectedPhotoIDs.insert(photoId) }
+                }
+                for photo in p.photos {
+                    affectedPhotoIDs.insert(photo.persistentModelID)
+                }
                 // 🚨 EKSTREMALNA OPTYMALIZACJA ZOMBIAKÓW
                 // Nie dotykamy p.faceCrops! Skasowanie osoby aktywuje regułę bazy danych (deleteRule: .cascade)
                 // i ukryty silnik SQLite sam po cichu wymaże z dysku twarze. Przyspieszenie 100x!
@@ -179,6 +188,34 @@ struct PeopleView: View {
                 if deletedCount % 200 == 0 { try? bgCtx.save() } // Batching dla bezpieczeństwa RAMu
             }
             try? bgCtx.save()
+            
+            // 🚨 Po skasowaniu: zdjęcia, które nie mają już ŻADNEJ twarzy, przestają być oznaczone
+            // jako "skanowane" - dzięki temu przy ponownym skanie nie pojawi się mylący monit
+            // "znaleziono 0 twarzy", tylko program potraktuje je jak nigdy nieskanowane.
+            for photoId in affectedPhotoIDs {
+                guard let photo: PhotoAsset = bgCtx.registeredModel(for: photoId) ?? (try? bgCtx.model(for: photoId)) as? PhotoAsset else { continue }
+                if photo.faceCrops.isEmpty {
+                    photo.isFaceScanned = false
+                }
+            }
+            try? bgCtx.save()
+            
+            // 🚨 KLUCZOWE: Synchronizacja z głównym kontekstem.
+            // SwiftData nie propaguje automatycznie zmian relacji (photo.people) z kontekstu
+            // tła do głównego kontekstu — ręcznie czyścimy zombie wpisy w UI.
+            let capturedIDs = Array(affectedPhotoIDs)
+            await MainActor.run {
+                let mainCtx = container.mainContext
+                for photoId in capturedIDs {
+                    guard let mainPhoto: PhotoAsset = mainCtx.registeredModel(for: photoId) ?? (try? mainCtx.model(for: photoId)) as? PhotoAsset else { continue }
+                    // Usuń wszystkie "Osoba X" z photo.people w głównym kontekście
+                    mainPhoto.people.removeAll { $0.name.hasPrefix("Osoba ") }
+                    if mainPhoto.faceCrops.isEmpty {
+                        mainPhoto.isFaceScanned = false
+                    }
+                }
+                try? mainCtx.save()
+            }
         }
     }
 }
@@ -573,7 +610,7 @@ struct PersonDetailWorkspace: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Label("Tagi", systemImage: "tag").font(.subheadline).foregroundColor(.secondary)
                                     FlowLayout(spacing: 6) {
-                                        ForEach(photo.keywords, id: \.self) { kw in
+                                        ForEach(Array(Set(photo.keywords)).sorted(), id: \.self) { kw in
                                             Button(action: {
                                                 activeSearchText = ""
                                                 searchKeywords = [kw]
@@ -659,11 +696,27 @@ struct PersonDetailWorkspace: View {
     
     private func deleteFaces(_ crops: [FaceCrop]) {
         let count = crops.count
+        var affectedPhotos: Set<PhotoAsset> = []
         for crop in crops {
             if let index = person.faceCrops.firstIndex(of: crop) { person.faceCrops.remove(at: index) }
+            if let photo = crop.photo {
+                affectedPhotos.insert(photo)
+                if let pIndex = photo.faceCrops.firstIndex(of: crop) { photo.faceCrops.remove(at: pIndex) }
+                photo.people.removeAll { $0.id == person.id }
+            }
             modelContext.delete(crop)
         }
         person.faceCount = max(0, person.faceCount - count)
+        
+        // 🚨 Jeśli po usunięciu zdjęcie nie ma już ŻADNEJ wykrytej twarzy, cofamy flagę "skanowania".
+        // Dzięki temu program nie będzie już fałszywie ostrzegał "znaleziono 0 twarzy" przy ponownym
+        // skanie - potraktuje takie zdjęcie tak, jakby nigdy nie było skanowane w poszukiwaniu twarzy.
+        for photo in affectedPhotos {
+            if photo.faceCrops.isEmpty {
+                photo.isFaceScanned = false
+            }
+        }
+        
         try? modelContext.save()
         selectedFaces.subtract(crops)
     }

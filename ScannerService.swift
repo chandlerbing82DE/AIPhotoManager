@@ -14,6 +14,98 @@ actor ScannerService {
         cancelRequested = true
     }
     
+    // =====================================================================
+    // 0. NAPRAWA BAZY: USUWANIE "ZOMBIE" TAGÓW OSÓB (np. stare "Osoba 3" wpisane
+    //    kiedyś na stałe do keywords, mimo że twarz została później usunięta/scalona)
+    // =====================================================================
+    func cleanupZombiePersonKeywords(container: ModelContainer, onProgress: @escaping @Sendable (Int, Int, String) -> Void) async {
+        let context = ModelContext(container)
+        context.autosaveEnabled = false
+        
+        await MainActor.run { onProgress(0, 0, "🧟 Szukanie zombie tagów Osób...") }
+        
+        guard let allPhotos = try? context.fetch(FetchDescriptor<PhotoAsset>()) else { return }
+        let total = allPhotos.count
+        var done = 0
+        var cleanedCount = 0
+        var affectedPhotoIDs: [PersistentIdentifier] = []
+        
+        // Regex dopasowujący automatycznie wygenerowane nazwy typu "Osoba 12"
+        let regex = try? NSRegularExpression(pattern: "^Osoba \\d+$")
+        
+        for photo in allPhotos {
+            if cancelRequested { break }
+            var changed = false
+            
+            // 1. Usuń WSZYSTKIE "Osoba X" z photo.keywords — tagi osób są przechowywane
+            //    WYŁĄCZNIE przez relację photo.people, nigdy przez tablicę keywords.
+            //    Stare wpisy "Osoba X" w keywords to zombie z poprzedniej wersji kodu.
+            if !photo.keywords.isEmpty {
+                let before = photo.keywords.count
+                photo.keywords = photo.keywords.filter { kw in
+                    guard let rx = regex else { return true }
+                    return rx.firstMatch(in: kw, range: NSRange(kw.startIndex..., in: kw)) == nil
+                }
+                if photo.keywords.count != before {
+                    changed = true
+                    cleanedCount += 1
+                }
+            }
+            
+            // 2. Usuń zombie wpisy z photo.people — osoby "Osoba X", które nie mają
+            //    żadnego FaceCrop powiązanego z tym konkretnym zdjęciem (stare relacje
+            //    po usunięciu/scaleniu osób, które nie zostały posprzątane).
+            let stalePersons = photo.people.filter { person in
+                guard person.name.hasPrefix("Osoba ") else { return false }
+                return !person.faceCrops.contains(where: { $0.photo?.persistentModelID == photo.persistentModelID })
+            }
+            if !stalePersons.isEmpty {
+                for p in stalePersons {
+                    photo.people.removeAll { $0.persistentModelID == p.persistentModelID }
+                    p.photos.removeAll { $0.persistentModelID == photo.persistentModelID }
+                }
+                changed = true
+            }
+            
+            if changed { affectedPhotoIDs.append(photo.persistentModelID) }
+            
+            done += 1
+            if done % 200 == 0 || done == total {
+                let cDone = done; let cCleaned = cleanedCount
+                await MainActor.run { onProgress(cDone, total, "🧟 Wyczyszczono \(cCleaned) zdjęć...") }
+                try? context.save()
+            }
+        }
+        try? context.save()
+        
+        // 🚨 KLUCZOWE: Synchronizacja z głównym kontekstem.
+        // SwiftData nie propaguje automatycznie zmian tablicowych z kontekstu tła
+        // do głównego kontekstu — robimy to ręcznie dla każdego zmodyfikowanego zdjęcia.
+        let capturedIDs = affectedPhotoIDs
+        await MainActor.run {
+            let mainCtx = container.mainContext
+            let rx = try? NSRegularExpression(pattern: "^Osoba \\d+$")
+            for photoId in capturedIDs {
+                guard let mainPhoto: PhotoAsset = mainCtx.registeredModel(for: photoId) ?? (try? mainCtx.model(for: photoId)) as? PhotoAsset else { continue }
+                // Sync keywords
+                if !mainPhoto.keywords.isEmpty, let rxNN = rx {
+                    mainPhoto.keywords = mainPhoto.keywords.filter { kw in
+                        rxNN.firstMatch(in: kw, range: NSRange(kw.startIndex..., in: kw)) == nil
+                    }
+                }
+                // Sync photo.people — usuń zombie "Osoba X"
+                mainPhoto.people.removeAll { p in
+                    guard p.name.hasPrefix("Osoba ") else { return false }
+                    return !p.faceCrops.contains(where: { $0.photo?.persistentModelID == mainPhoto.persistentModelID })
+                }
+            }
+            try? mainCtx.save()
+        }
+        
+        let finalCleaned = cleanedCount
+        await MainActor.run { onProgress(total, total, "✅ Gotowe! Naprawiono \(finalCleaned) zdjęć.") }
+    }
+    
     private class Cluster {
         let person: Person
         var centroidVector: [Double]
@@ -267,9 +359,22 @@ actor ScannerService {
                 await MainActor.run { onProgress(cDone, total, "Twarze: \(fName)") }
                 
                 if forceOverwrite && photo.isFaceScanned {
-                    for crop in photo.faceCrops {
-                        if let person = crop.person { person.faceCount -= 1 }
+                    let oldCrops = Array(photo.faceCrops)
+                    let oldPeople = Array(photo.people)
+                    // 🚨 KRYTYCZNA POPRAWKA: Musimy JAWNIE usunąć crop z tablicy person.faceCrops
+                    // przed wywołaniem context.delete(). SwiftData nie aktualizuje relacji odwrotnej
+                    // natychmiast w pamięci — crop zostaje "zombie" w person.faceCrops, przez co
+                    // nowe twarze są dokładane do starej (niepustej) tablicy zamiast ją zastąpić.
+                    for crop in oldCrops {
+                        if let person = crop.person {
+                            person.faceCount = max(0, person.faceCount - 1)
+                            person.faceCrops.removeAll { $0.id == crop.id }
+                        }
                         context.delete(crop)
+                    }
+                    // Usuń odwrotne powiązania zdjęcia z osobami
+                    for person in oldPeople {
+                        person.photos.removeAll { $0.id == photo.id }
                     }
                     photo.faceCrops.removeAll()
                     photo.people.removeAll()
@@ -284,16 +389,20 @@ actor ScannerService {
                             let width = face.bbox[2] - face.bbox[0]
                             let height = face.bbox[3] - face.bbox[1]
                             
-                            // 🚨 ZŁAGODZONY FILTR: Przepuszczamy małe twarze (od 10px) i profile twarzy (score od 0.40)
-                            if width < 10 || height < 10 { continue }
-                            if let score = face.score, score < 0.40 { continue }
+                            // 🚨 ZBALANSOWANY FILTR: Odrzucamy śmieciowe mikro-detekcje (fałszywe alarmy),
+                            // ale wciąż przepuszczamy rozsądnie małe twarze i lekkie profile.
+                            if width < 16 || height < 16 { continue }
+                            if let score = face.score, score < 0.5 { continue }
                             
                             let cropData = ScannerService.cropImage(from: highResData, bbox: face.bbox)
                             let dnaData = try? JSONEncoder().encode(face.embedding)
                             
                             let faceCrop = FaceCrop(cropData: cropData ?? highResData, featurePrintData: dnaData)
-                            faceCrop.photo = photo
+                            // 🚨 KLUCZOWA KOLEJNOŚĆ: context.insert() MUSI być PRZED ustawieniem relacji!
+                            // SwiftData śledzi zmiany relacji TYLKO na obiektach już wstawionych do kontekstu.
+                            // Ustawienie faceCrop.photo przed insertem powoduje że crop.photo = NIL w bazie.
                             context.insert(faceCrop)
+                            faceCrop.photo = photo
                             photo.faceCrops.append(faceCrop)
                             
                             var bestMatch: Cluster? = nil
@@ -337,14 +446,35 @@ actor ScannerService {
                     photo.isFaceScanned = true
                 }
                 
-                // 🚨 SZYBKIE ODŚWIEŻANIE INTERFEJSU
-                if forceOverwrite { try? context.save() }
+                // Zapisz background context, żeby relacje trafiły do SQLite
+                try? context.save()
+                
+                // 🚨 KLUCZOWE: Jawnie aktualizujemy relacje w GŁÓWNYM kontekście.
+                // SwiftData nie propaguje automatycznie zmian relacji (person.photos, photo.people)
+                // z tła do głównego kontekstu. Musimy to zrobić ręcznie, żeby tagi Osób
+                // pozostawały widoczne po nawigacji (a nie znikały po chwili).
                 let photoId = photo.id
+                let updatedKeywords = photo.keywords
+                let personPIDs = photo.people.map { $0.persistentModelID }
+                
                 await MainActor.run {
                     let mainCtx = container.mainContext
-                    if let mainPhoto = self.getPhotoAsset(pid: pid, context: mainCtx) {
-                        mainPhoto.isFaceScanned = true
+                    guard let mainPhoto = self.getPhotoAsset(pid: pid, context: mainCtx) else {
+                        NotificationCenter.default.post(name: NSNotification.Name("AIPhotoUpdated"), object: photoId)
+                        return
                     }
+                    mainPhoto.isFaceScanned = true
+                    mainPhoto.keywords = updatedKeywords
+                    
+                    // Jawnie linkujemy każdą Osobę z tym Zdjęciem w głównym kontekście
+                    for personPID in personPIDs {
+                        let mainPerson: Person? = mainCtx.registeredModel(for: personPID) ?? (try? mainCtx.model(for: personPID)) as? Person
+                        if let p = mainPerson {
+                            if !mainPhoto.people.contains(p) { mainPhoto.people.append(p) }
+                            if !p.photos.contains(mainPhoto) { p.photos.append(mainPhoto) }
+                        }
+                    }
+                    try? mainCtx.save()
                     NotificationCenter.default.post(name: NSNotification.Name("AIPhotoUpdated"), object: photoId)
                 }
             }

@@ -63,7 +63,8 @@ struct ContentView: View {
     @Query private var allFolders: [VirtualFolder]
     @Query private var allEvents: [EventFolder]
     @Query(filter: #Predicate<VirtualFolder> { $0.parentFolder == nil }, sort: \VirtualFolder.name) private var rootFolders: [VirtualFolder]
-    @Query(filter: #Predicate<EventFolder> { $0.parentEvent == nil }, sort: \EventFolder.name) private var rootEvents: [EventFolder]
+    @Query(filter: #Predicate<EventFolder> { $0.parentEvent == nil && $0.generatedAutomatically == false }, sort: \EventFolder.name) private var manualRootEvents: [EventFolder]
+    @Query(filter: #Predicate<EventFolder> { $0.parentEvent == nil && $0.generatedAutomatically == true }, sort: \EventFolder.name, order: .reverse) private var scanRootEvents: [EventFolder]
     
     @State private var jobState = JobState()
     @State private var selectedNavItems: Set<NavigationItem> = [.allPhotos]
@@ -88,6 +89,7 @@ struct ContentView: View {
     @State private var showingGlobalFacesAlert = false
     @State private var showingFaceOverwriteAlert = false
     @State private var pendingFacePhotos: [PhotoAsset] = []
+    @State private var pendingFaceCount: Int = 0
     
     var isSearchActive: Bool { !activeSearchText.isEmpty || !activeSearchDate.isEmpty || activeSearchVIP || activeSearchColorHex != nil || !activeRatings.isEmpty }
     var isPeopleTab: Bool { if selectedNavItems.count == 1, let item = selectedNavItems.first { switch item { case .peopleTop100, .peopleOther, .peopleUnnamed: return true; default: return false } }; return false }
@@ -210,7 +212,7 @@ struct ContentView: View {
         .alert("Zmień nazwę", isPresented: $showingRenameAlert) { TextField("Nazwa", text: $renameText); Button("Anuluj", role: .cancel) { }; Button("Zapisz") { if let item = itemToRename { switch item { case .folder(let f): f.name = renameText; case .event(let e): e.name = renameText; default: break }; try? modelContext.save() } } }
         .alert("Nowe wydarzenie", isPresented: $showingCreateRootEventAlert) { TextField("Nazwa", text: $newRootEventName); Button("Anuluj", role: .cancel) { }; Button("Utwórz") { guard !newRootEventName.isEmpty else { return }; modelContext.insert(EventFolder(name: newRootEventName, generatedAutomatically: false)); try? modelContext.save() } }
         .alert("Nadpisać opisy?", isPresented: $showingOverwriteAlert) { Button("Anuluj", role: .cancel) { pendingAIPhotos.removeAll() }; Button("Nadpisz", role: .destructive) { executeAIScan(photos: pendingAIPhotos, force: true); pendingAIPhotos.removeAll() } } message: { Text("Te zdjęcia już mają opisy.") }
-        .alert("Nadpisać twarze?", isPresented: $showingFaceOverwriteAlert) { Button("Anuluj", role: .cancel) { pendingFacePhotos.removeAll() }; Button("Nadpisz", role: .destructive) { executeFaceScan(photos: pendingFacePhotos, force: true); pendingFacePhotos.removeAll() } } message: { Text("Te zdjęcia zostały już wcześniej zeskanowane. Czy chcesz skasować obecne twarze i wyszukać je ponownie?") }
+        .alert("Nadpisać twarze?", isPresented: $showingFaceOverwriteAlert) { Button("Anuluj", role: .cancel) { pendingFacePhotos.removeAll() }; Button("Nadpisz", role: .destructive) { executeFaceScan(photos: pendingFacePhotos, force: true); pendingFacePhotos.removeAll() } } message: { Text("Te zdjęcia zostały już wcześniej przebadane przez skaner. Znalazł on do tej pory na nich zaledwie \(pendingFaceCount) twarzy. Czy chcesz zresetować te ustawienia i wyszukać ponownie (np. nowym modelem)?") }
         .alert("Połącz", isPresented: $showingMultiMergeAlert) { TextField("Nazwa", text: $mergedEventName); Button("Anuluj", role: .cancel) { }; Button("Złącz") { guard !mergedEventName.isEmpty, !eventsToMerge.isEmpty else { return }; let nE = EventFolder(name: mergedEventName, generatedAutomatically: false); modelContext.insert(nE); for e in eventsToMerge { for p in e.photos { p.event = nE }; modelContext.delete(e) }; try? modelContext.save(); selectedNavItems = [.event(nE)] } }
     }
 
@@ -227,8 +229,8 @@ struct ContentView: View {
                     }
                     Section(header: Text("Albumy (Drzewo)")) { OutlineGroup(rootFolders, children: \.optionalChildFolders) { folder in folderRowView(for: folder) } }
                     Section(header: HStack { Text("Wydarzenia"); Spacer(); Button(action: { newRootEventName = ""; showingCreateRootEventAlert = true }) { Image(systemName: "plus") }.buttonStyle(.plain) }) {
-                        DisclosureGroup(isExpanded: $isManualEventsExpanded) { OutlineGroup(rootEvents.filter { !$0.generatedAutomatically }, children: \.optionalChildEvents) { event in eventRowView(for: event) } } label: { Label("Ręczne", systemImage: "person.3.sequence.fill") }
-                        DisclosureGroup(isExpanded: $isScanEventsExpanded) { OutlineGroup(rootEvents.filter { $0.generatedAutomatically }, children: \.optionalChildEvents) { event in eventRowView(for: event) } } label: { Label("Skan", systemImage: "sparkles") }
+                        DisclosureGroup(isExpanded: $isManualEventsExpanded) { OutlineGroup(manualRootEvents, children: \.optionalChildEvents) { event in eventRowView(for: event) } } label: { Label("Ręczne", systemImage: "person.3.sequence.fill") }
+                        DisclosureGroup(isExpanded: $isScanEventsExpanded) { ForEach(scanRootEvents) { event in eventRowView(for: event) } } label: { Label("Skan", systemImage: "sparkles") }
                     }
                     Section("Narzędzia") { Label("Słowa kluczowe", systemImage: "tag").tag(NavigationItem.keywords) }
                     Section("Osoby") {
@@ -336,7 +338,20 @@ struct ContentView: View {
     private func requestFaceScan(photos: [PhotoAsset], force: Bool = false) {
         if force {
             let hasExisting = photos.contains { $0.isFaceScanned }
-            if hasExisting { pendingFacePhotos = photos; showingFaceOverwriteAlert = true; return }
+            if hasExisting {
+                pendingFacePhotos = photos
+                // 🚨 Świeże, wiarygodne policzenie twarzy - bezpośrednie odczytanie photo.faceCrops.count
+                // może pokazać nieaktualną (np. zerową) wartość, jeśli obiekt był wcześniej wczytany
+                // do pamięci zanim skaner w tle dopisał twarze. Dlatego liczymy na nowo wprost z bazy.
+                let ids = Set(photos.map { $0.id })
+                if let allCrops = try? modelContext.fetch(FetchDescriptor<FaceCrop>()) {
+                    pendingFaceCount = allCrops.filter { crop in if let pid = crop.photo?.id { return ids.contains(pid) }; return false }.count
+                } else {
+                    pendingFaceCount = 0
+                }
+                showingFaceOverwriteAlert = true
+                return
+            }
         }
         executeFaceScan(photos: photos, force: force)
     }
@@ -506,6 +521,7 @@ struct WorkspaceView: View {
                     Button(action: onAIGlobalToolbar) { Label("Opisz wszystkie (AI)", systemImage: "wand.and.stars.inverse") }.disabled(jobState.isActive).help("Opisy, oceny i tagi AI")
                     Button(action: onScanCleanupToolbar) { Label("Skanuj porządkowo", systemImage: "eraser") }.disabled(jobState.isActive).help("Skanuj duplikaty i dokumenty")
                     Button(action: onScanFacesToolbar) { Label("Skanuj brakujące twarze", systemImage: "person.crop.circle.badge.plus") }.disabled(jobState.isActive).help("Znajdź twarze")
+                    Button(action: cleanupZombieTags) { Label("Napraw zombie tagi Osób", systemImage: "wand.and.rays") }.disabled(jobState.isActive).help("Usuwa nieaktualne tagi 'Osoba X' pozostałe po skasowanych/scalonych twarzach")
                     Button(role: .destructive, action: { onDeleteDatabase() }) { Label("Usuń całą bazę", systemImage: "trash.circle.fill").foregroundStyle(.red) }.help("USUŃ CAŁĄ BAZĘ")
                 }
                 ToolbarItem(placement: .navigation) { Button(action: { isInspectorPresented.toggle() }) { Label("Inspektor", systemImage: "sidebar.right") }.disabled(isPeopleTab).help("Panel boczny") }
@@ -554,6 +570,22 @@ struct WorkspaceView: View {
             hasAnyPhoto = !check.isEmpty
         }
     }
+    private func cleanupZombieTags() {
+        jobState.isScanning = true
+        jobState.progressStatus = "Szukanie zombie tagów..."
+        let c = modelContext.container
+        let s = ScannerService()
+        jobState.currentScanner = s
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "Naprawa zombie tagów")
+        Task {
+            await s.cleanupZombiePersonKeywords(container: c) { d, t, st in Task { @MainActor in self.jobState.progressCount = d; self.jobState.progressTotal = t; self.jobState.progressStatus = st } }
+            await MainActor.run {
+                self.jobState.isScanning = false
+                self.jobState.currentScanner = nil
+                ProcessInfo.processInfo.endActivity(activity)
+            }
+        }
+    }
     private func movePhotosToTrash(_ photos: [PhotoAsset]) { let now = Date(); for photo in photos { photo.isTrash = true; photo.trashDate = now; photo.reviewCategory = nil; photo.folder = nil; photo.event = nil; photo.people.removeAll(); for crop in photo.faceCrops { if let person = crop.person { person.faceCount -= 1 }; modelContext.delete(crop) }; photo.faceCrops.removeAll() }; try? modelContext.save(); selectedPhotos.removeAll() }
     private func restorePhotos(_ photos: [PhotoAsset]) { for photo in photos { photo.isTrash = false; photo.trashDate = nil }; try? modelContext.save(); selectedPhotos.removeAll() }
     private func permanentlyDelete(_ photos: [PhotoAsset]) { for photo in photos { LocalStorage.deleteThumbnail(id: photo.id); for crop in photo.faceCrops { modelContext.delete(crop) }; modelContext.delete(photo) }; try? modelContext.save(); selectedPhotos.removeAll() }
@@ -580,14 +612,79 @@ struct PhotoGridView: View {
 
 struct PhotoInspectorView: View {
     @Environment(\.modelContext) private var modelContext; @Bindable var photo: PhotoAsset; @Binding var searchKeywords: Set<String>; @Binding var selectedNavItems: Set<NavigationItem>; @Binding var searchText: String; var onScanAI: ([PhotoAsset], Bool) -> Void; var onExport: (PhotoAsset) -> Void; @State private var metadata: PhotoMetadata?; @State private var localSelectedKeywords: Set<String> = []; @State private var coordinate: CLLocationCoordinate2D?; @State private var isXMPExpanded: Bool = false
-    var body: some View { Form { Section("Plik") { LabeledContent("Nazwa", value: photo.fileName); Text(photo.originalPath).font(.caption2).foregroundStyle(.secondary); Button(action: { onExport(photo) }) { Label("Eksportuj na dysk...", systemImage: "square.and.arrow.up") } }; Section("Inteligentna Analiza") { Button(action: { onScanAI([photo], true) }) { HStack { Image(systemName: "wand.and.stars"); Text(photo.imageDescription.isEmpty ? "Wygeneruj opis i tagi (AI)" : "Przeanalizuj ponownie (AI)") } }.buttonStyle(.plain).foregroundColor(.accentColor) }; if photo.isAiScanned || !photo.imageDescription.isEmpty || !photo.keywords.isEmpty || !photo.people.isEmpty { Section("Dane w programie") { if photo.isAiScanned { LabeledContent("Ocena AI", value: "\(photo.rating) / 6") }; let allTags = Array(Set(photo.keywords + photo.people.map { $0.name })).sorted(); if !allTags.isEmpty { FlowLayout(spacing: 6) { ForEach(allTags, id: \.self) { kw in Button(action: { searchText = ""; searchKeywords = [kw]; selectedNavItems = [.keywords] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.green).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4) }; if !photo.imageDescription.isEmpty { Text(photo.imageDescription).font(.callout) } } }; Section("Lokalizacja w bibliotece") { HStack { Image(systemName: "calendar").foregroundColor(photo.event?.colorHex != nil ? colorFromHex(photo.event?.colorHex) : .accentColor); LabeledContent("Wydarzenie", value: photo.event?.name ?? "Brak") }; HStack { Image(systemName: "folder.fill").foregroundColor(photo.folder?.colorHex != nil ? colorFromHex(photo.folder?.colorHex) : .accentColor); LabeledContent("Album", value: photo.folder?.name ?? "Brak") } }; Section("Status VIP") { Toggle(isOn: $photo.isVIP) { Label("Oznacz jako VIP", systemImage: photo.isVIP ? "star.fill" : "star").foregroundColor(photo.isVIP ? .yellow : .primary) } }; if let coord = coordinate { Section("Geolokalizacja (GPS)") { Map(initialPosition: .region(MKCoordinateRegion(center: coord, span: MKCoordinateSpan(latitudeDelta: 0.05, longitudeDelta: 0.05)))) { Marker(photo.fileName, coordinate: coord) }.frame(height: 200).cornerRadius(8).padding(.vertical, 4) } }; if let meta = metadata { Section { DisclosureGroup(isExpanded: $isXMPExpanded) { if !meta.xmpKeywords.isEmpty { FlowLayout(spacing: 6) { ForEach(meta.xmpKeywords, id: \.self) { kw in Button(action: { if localSelectedKeywords.contains(kw) { localSelectedKeywords.remove(kw) } else { localSelectedKeywords.insert(kw) } }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(localSelectedKeywords.contains(kw) ? Color.accentColor : Color.secondary.opacity(0.2)).foregroundColor(localSelectedKeywords.contains(kw) ? .white : .primary).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4); if !localSelectedKeywords.isEmpty { Button(action: { searchText = ""; searchKeywords = localSelectedKeywords; selectedNavItems = [.keywords] }) { HStack { Image(systemName: "magnifyingglass"); Text("Szukaj powiązanych (\(localSelectedKeywords.count))") }.font(.callout.bold()).foregroundColor(.accentColor) }.buttonStyle(.plain).padding(.top, 4) } } else { Text("Brak pliku XMP / tagów").foregroundStyle(.secondary) }; if let desc = meta.xmpDescription { Divider(); Text(desc).font(.callout) } } label: { Text("Odczyt z pliku na dysku (.xmp)").font(.headline) } } } else { ProgressView("Wczytywanie XMP...") }; Section("Ustawienia systemowe") { TextField("Wirtualna Data", text: Binding(get: { photo.virtualDateString ?? "" }, set: { photo.virtualDateString = $0.isEmpty ? nil : $0 })) } }.formStyle(.grouped).navigationTitle("Szczegóły Zdjęcia").onChange(of: photo.id) { _, _ in localSelectedKeywords.removeAll(); coordinate = nil; isXMPExpanded = false }.task(id: photo.id) { loadData() }.onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("AIPhotoUpdated"))) { notification in if let updatedId = notification.object as? UUID, updatedId == photo.id { loadData() } } }
+    // 🚨 KLUCZOWA POPRAWKA: @Query to WŁAŚCIWY, wbudowany mechanizm SwiftData, który
+    // SAM automatycznie odświeża się przy KAŻDEJ zmianie w bazie (nawet zapisanej przez inny
+    // kontekst w tle, np. skaner). W przeciwieństwie do ręcznego `context.fetch()` czy
+    // odczytu relacji na już wczytanym obiekcie, @Query NIGDY nie pokazuje "znikających po chwili"
+    // nieaktualnych danych - to definitywnie rozwiązuje problem z tagami Osób.
+    @Query private var allPeopleQuery: [Person]
+    
+    private var peopleTags: [String] {
+        // photo.people jest ustawiane jawnie w głównym kontekście przez ScannerService po każdym skanie.
+        // @Bindable reaguje na zmiany, więc widok odświeży się automatycznie.
+        let fromRelation = photo.people.map { $0.name }
+        if !fromRelation.isEmpty {
+            return Array(Set(fromRelation)).sorted()
+        }
+        // Fallback: sprawdź przez @Query (dla starszych danych lub przypadków granicznych)
+        let pid = photo.id
+        var names: Set<String> = []
+        for person in allPeopleQuery {
+            if person.photos.contains(where: { $0.id == pid }) { names.insert(person.name) }
+        }
+        return Array(names).sorted()
+    }
+
+    var body: some View { Form { Section("Plik") { LabeledContent("Nazwa", value: photo.fileName); Text(photo.originalPath).font(.caption2).foregroundStyle(.secondary); Button(action: { onExport(photo) }) { Label("Eksportuj na dysk...", systemImage: "square.and.arrow.up") } }; Section("Inteligentna Analiza") { Button(action: { onScanAI([photo], true) }) { HStack { Image(systemName: "wand.and.stars"); Text(photo.imageDescription.isEmpty ? "Wygeneruj opis i tagi (AI)" : "Przeanalizuj ponownie (AI)") } }.buttonStyle(.plain).foregroundColor(.accentColor) }; let keywordTags = Array(Set(photo.keywords).subtracting(peopleTags)).sorted(); if photo.isAiScanned || photo.isFaceScanned || !photo.imageDescription.isEmpty || !keywordTags.isEmpty || !peopleTags.isEmpty || !photo.faceCrops.isEmpty { Section("Dane w programie") { if photo.isAiScanned { LabeledContent("Ocena AI", value: "\(photo.rating) / 6") }; if !peopleTags.isEmpty || !keywordTags.isEmpty { FlowLayout(spacing: 6) { ForEach(peopleTags, id: \.self) { kw in Button(action: { searchText = kw; selectedNavItems = [.allPhotos] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.blue).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) }; ForEach(keywordTags, id: \.self) { kw in Button(action: { searchText = ""; searchKeywords = [kw]; selectedNavItems = [.keywords] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.green).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4) }; if !photo.imageDescription.isEmpty { Text(photo.imageDescription).font(.callout) } } }; Section("Lokalizacja w bibliotece") { HStack { Image(systemName: "calendar").foregroundColor(photo.event?.colorHex != nil ? colorFromHex(photo.event?.colorHex) : .accentColor); LabeledContent("Wydarzenie", value: photo.event?.name ?? "Brak") }; HStack { Image(systemName: "folder.fill").foregroundColor(photo.folder?.colorHex != nil ? colorFromHex(photo.folder?.colorHex) : .accentColor); LabeledContent("Album", value: photo.folder?.name ?? "Brak") } }; Section("Status VIP") { Toggle(isOn: $photo.isVIP) { Label("Oznacz jako VIP", systemImage: photo.isVIP ? "star.fill" : "star").foregroundColor(photo.isVIP ? .yellow : .primary) } }; if let coord = coordinate { Section("Geolokalizacja (GPS)") { Map(initialPosition: .region(MKCoordinateRegion(center: coord, span: MKCoordinateSpan(latitudeDelta: 0.05, longitudeDelta: 0.05)))) { Marker(photo.fileName, coordinate: coord) }.frame(height: 200).cornerRadius(8).padding(.vertical, 4) } }; if let meta = metadata { Section { DisclosureGroup(isExpanded: $isXMPExpanded) { if !meta.xmpKeywords.isEmpty { FlowLayout(spacing: 6) { ForEach(Array(Set(meta.xmpKeywords)).sorted(), id: \.self) { kw in Button(action: { if localSelectedKeywords.contains(kw) { localSelectedKeywords.remove(kw) } else { localSelectedKeywords.insert(kw) } }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(localSelectedKeywords.contains(kw) ? Color.accentColor : Color.secondary.opacity(0.2)).foregroundColor(localSelectedKeywords.contains(kw) ? .white : .primary).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4); if !localSelectedKeywords.isEmpty { Button(action: { searchText = ""; searchKeywords = localSelectedKeywords; selectedNavItems = [.keywords] }) { HStack { Image(systemName: "magnifyingglass"); Text("Szukaj powiązanych (\(localSelectedKeywords.count))") }.font(.callout.bold()).foregroundColor(.accentColor) }.buttonStyle(.plain).padding(.top, 4) } } else { Text("Brak pliku XMP / tagów").foregroundStyle(.secondary) }; if let desc = meta.xmpDescription { Divider(); Text(desc).font(.callout) } } label: { Text("Odczyt z pliku na dysku (.xmp)").font(.headline) } } } else { ProgressView("Wczytywanie XMP...") }; Section("Ustawienia systemowe") { TextField("Wirtualna Data", text: Binding(get: { photo.virtualDateString ?? "" }, set: { photo.virtualDateString = $0.isEmpty ? nil : $0 })) } }.formStyle(.grouped).navigationTitle("Szczegóły Zdjęcia").onChange(of: photo.id) { _, _ in localSelectedKeywords.removeAll(); coordinate = nil; isXMPExpanded = false }.task(id: photo.id) { loadData() } }
+
     private func loadData() { let path = photo.originalPath; Task { self.metadata = await Task.detached { MetadataReader.readMetadata(from: path) }.value; self.coordinate = await Task.detached { self.extractGPS(from: path) }.value } }
     nonisolated private func extractGPS(from path: String) -> CLLocationCoordinate2D? { let url = URL(fileURLWithPath: path); guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any], let gps = properties[kCGImagePropertyGPSDictionary as String] as? [String: Any], let lat = gps[kCGImagePropertyGPSLatitude as String] as? Double, let latRef = gps[kCGImagePropertyGPSLatitudeRef as String] as? String, let lon = gps[kCGImagePropertyGPSLongitude as String] as? Double, let lonRef = gps[kCGImagePropertyGPSLongitudeRef as String] as? String else { return nil }; return CLLocationCoordinate2D(latitude: latRef == "S" ? -lat : lat, longitude: lonRef == "W" ? -lon : lon) }
     private func colorFromHex(_ hex: String?) -> Color { guard let hex = hex, hex.hasPrefix("#") else { return .accentColor }; let start = hex.index(hex.startIndex, offsetBy: 1); if String(hex[start...]).count == 6 { let s = Scanner(string: String(hex[start...])); var n: UInt64 = 0; if s.scanHexInt64(&n) { return Color(red: Double((n & 0xff0000) >> 16) / 255, green: Double((n & 0x00ff00) >> 8) / 255, blue: Double(n & 0x0000ff) / 255) } }; return .accentColor }
 }
 
 struct FlowLayout: Layout {
-    var spacing: CGFloat; func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize { return FlowResult(in: proposal.width ?? 100, subviews: subviews, spacing: spacing).size }; func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) { let result = FlowResult(in: bounds.width, subviews: subviews, spacing: spacing); for (index, subview) in subviews.enumerated() { subview.place(at: CGPoint(x: bounds.minX + result.frames[index].origin.x, y: bounds.minY + result.frames[index].origin.y), proposal: .unspecified) } }; struct FlowResult { var size: CGSize = .zero; var frames: [CGRect] = []; init(in maxWidth: CGFloat, subviews: Subviews, spacing: CGFloat) { var cX: CGFloat = 0; var cY: CGFloat = 0; var lH: CGFloat = 0; for subview in subviews { let size = subview.sizeThatFits(.unspecified); if cX + size.width > maxWidth && cX > 0 { cX = 0; cY += lH + spacing; lH = 0 }; frames.append(CGRect(x: cX, y: cY, width: size.width, height: size.height)); lH = max(lH, size.height); cX += size.width + spacing }; self.size = CGSize(width: maxWidth, height: cY + lH) } }
+    var spacing: CGFloat
+    
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let w = proposal.width ?? 300
+        let effectiveWidth = w > 0 ? w : 300
+        return layout(subviews: subviews, maxWidth: effectiveWidth).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let effectiveWidth = bounds.width > 0 ? bounds.width : 300
+        let frames = layout(subviews: subviews, maxWidth: effectiveWidth).frames
+        for (index, view) in subviews.enumerated() {
+            if index < frames.count {
+                view.place(at: CGPoint(x: bounds.minX + frames[index].minX, y: bounds.minY + frames[index].minY), proposal: .unspecified)
+            }
+        }
+    }
+
+    private func layout(subviews: Subviews, maxWidth: CGFloat) -> (size: CGSize, frames: [CGRect]) {
+        var frames: [CGRect] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var maxRowHeight: CGFloat = 0
+        var maxTotalWidth: CGFloat = 0
+
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            
+            if x + size.width > maxWidth && x > 0 {
+                x = 0
+                y += maxRowHeight + spacing
+                maxRowHeight = 0
+            }
+            
+            frames.append(CGRect(x: x, y: y, width: size.width, height: size.height))
+            maxRowHeight = max(maxRowHeight, size.height)
+            x += size.width + spacing
+            maxTotalWidth = max(maxTotalWidth, x - spacing)
+        }
+        
+        return (CGSize(width: maxTotalWidth, height: y + maxRowHeight), frames)
+    }
 }
 
 // ==========================================
