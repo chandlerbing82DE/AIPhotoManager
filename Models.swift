@@ -28,7 +28,8 @@ final class PhotoAsset {
     var virtualDateString: String?
     var isVIP: Bool = false
     
-    var rating: Int = 0 // 👈 DODANA ZMIENNA: Ocena AI (0-6)
+    var rating: Int = 0         // Ocena AI (0-6)
+    var colorLabel: String? = nil // Etykieta koloru (#hex), np. "#FF3B30"
     
     var isFaceScanned: Bool = false
     var isAiScanned: Bool = false
