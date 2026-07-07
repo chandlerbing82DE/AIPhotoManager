@@ -1,6 +1,8 @@
 
 
-<img width="1421" height="940" alt="Bildschirmfoto 2026-07-05 um 21 27 58" src="https://github.com/user-attachments/assets/a93fed61-ffe4-4d24-9d21-e94e6f77b16b" />
+<img width="1421" height="940" alt="Bildschirmfoto 2026-07-07 um 08 26 40" src="https://github.com/user-attachments/assets/5acd44d7-5115-46a9-aed7-c3b9917fc430" />
+<img width="1421" height="940" alt="Bildschirmfoto 2026-07-07 um 08 28 00" src="https://github.com/user-attachments/assets/ceef4d66-33a7-4657-a3f4-80f10854e091" />
+
 
 
 
