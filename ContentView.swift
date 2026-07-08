@@ -79,7 +79,7 @@ struct ContentView: View {
     @State private var activeSearchText: String = ""
     @State private var activeSearchDate: String = ""
     @State private var activeSearchVIP: Bool = false
-    @State private var activeSearchColorHex: String? = nil
+    @State private var activeSearchColorHex: Set<String> = []
     @State private var activeRatings: Set<Int> = []
     
     @State private var currentSearchTask: Task<Void, Never>? = nil
@@ -91,7 +91,7 @@ struct ContentView: View {
     @State private var pendingFacePhotos: [PhotoAsset] = []
     @State private var pendingFaceCount: Int = 0
     
-    var isSearchActive: Bool { !activeSearchText.isEmpty || !activeSearchDate.isEmpty || activeSearchVIP || activeSearchColorHex != nil || !activeRatings.isEmpty }
+    var isSearchActive: Bool { !activeSearchText.isEmpty || !activeSearchDate.isEmpty || activeSearchVIP || !activeSearchColorHex.isEmpty || !activeRatings.isEmpty }
     var isPeopleTab: Bool { if selectedNavItems.count == 1, let item = selectedNavItems.first { switch item { case .peopleTop100, .peopleOther, .peopleUnnamed: return true; default: return false } }; return false }
     
     private func loadPhotosFromDatabase() {
@@ -101,12 +101,100 @@ struct ContentView: View {
             let container = modelContext.container
             let text = activeSearchText.lowercased()
             let date = activeSearchDate.lowercased()
-            // 🚨 NIE lowercase hexColor — SQL predykat używa == (case-sensitive).
-            // colorLabel jest zapisywany jako np. "#FF3B30" (uppercase) i musi się zgadzać.
-            let hexColor = activeSearchColorHex
+            let hexColors = activeSearchColorHex          // Set<String>
             let ratings = activeRatings
             let isVIPOnly = selectedNavItems.contains(.vipPhotos) || activeSearchVIP
+            let isTextSearch = !text.isEmpty
             
+            // ⚡️ FAST PATH: tylko filtry strukturalne (kolor/ocena/VIP) bez tekstu i daty.
+            if !isTextSearch && date.isEmpty {
+                var results: [PhotoAsset] = []
+                var seenIDs = Set<UUID>()
+                
+                func addPhoto(_ p: PhotoAsset) {
+                    guard seenIDs.insert(p.id).inserted else { return }
+                    results.append(p)
+                }
+                
+                func matchesColors(_ p: PhotoAsset) -> Bool {
+                    guard !hexColors.isEmpty else { return true }
+                    let pHex = (p.colorLabel ?? "").lowercased()
+                    let fHex = (p.folder?.colorHex ?? "").lowercased()
+                    let eHex = (p.event?.colorHex ?? "").lowercased()
+                    return hexColors.contains(where: { h in
+                        let hLow = h.lowercased()
+                        return pHex == hLow || fHex == hLow || eHex == hLow
+                    })
+                }
+                
+                // Ocena (SQL)
+                for r in ratings {
+                    if results.count >= 200 { break }
+                    let pred: Predicate<PhotoAsset> = isVIPOnly
+                        ? #Predicate<PhotoAsset> { $0.isTrash == false && $0.isVIP == true && $0.rating == r }
+                        : #Predicate<PhotoAsset> { $0.isTrash == false && $0.rating == r }
+                    var desc = FetchDescriptor<PhotoAsset>(predicate: pred, sortBy: [SortDescriptor(\.fileName)])
+                    desc.fetchLimit = 200
+                    if let fetched = try? modelContext.fetch(desc) {
+                        for p in fetched where matchesColors(p) {
+                            addPhoto(p)
+                            if results.count >= 200 { break }
+                        }
+                    }
+                }
+                
+                // Kolor (SQL)
+                for hex in hexColors {
+                    if results.count >= 200 { break }
+                    let pred = #Predicate<PhotoAsset> { photo in
+                        photo.isTrash == false && photo.colorLabel == hex
+                    }
+                    var desc = FetchDescriptor<PhotoAsset>(predicate: pred, sortBy: [SortDescriptor(\.fileName)])
+                    desc.fetchLimit = 200
+                    if let fetched = try? modelContext.fetch(desc) {
+                        for p in fetched {
+                            if !ratings.isEmpty && !ratings.contains(p.rating) { continue }
+                            if isVIPOnly && !p.isVIP { continue }
+                            addPhoto(p)
+                            if results.count >= 200 { break }
+                        }
+                    }
+                    let folderPred = #Predicate<VirtualFolder> { $0.colorHex == hex }
+                    if let folders = try? modelContext.fetch(FetchDescriptor<VirtualFolder>(predicate: folderPred)) {
+                        for f in folders {
+                            for p in f.photos where !p.isTrash {
+                                if !ratings.isEmpty && !ratings.contains(p.rating) { continue }
+                                if isVIPOnly && !p.isVIP { continue }
+                                addPhoto(p)
+                                if results.count >= 200 { break }
+                            }
+                        }
+                    }
+                    let eventPred = #Predicate<EventFolder> { $0.colorHex == hex }
+                    if let events = try? modelContext.fetch(FetchDescriptor<EventFolder>(predicate: eventPred)) {
+                        for e in events {
+                            for p in e.photos where !p.isTrash {
+                                if !ratings.isEmpty && !ratings.contains(p.rating) { continue }
+                                if isVIPOnly && !p.isVIP { continue }
+                                addPhoto(p)
+                                if results.count >= 200 { break }
+                            }
+                        }
+                    }
+                }
+                
+                // Tylko VIP, bez koloru i oceny
+                if isVIPOnly && hexColors.isEmpty && ratings.isEmpty {
+                    var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.isVIP == true }, sortBy: [SortDescriptor(\.fileName)])
+                    desc.fetchLimit = 500
+                    results = (try? modelContext.fetch(desc)) ?? []
+                }
+                
+                displayPhotos = results
+                return
+            }
+            
+            // === ŚCIEŻKA TŁOWA (text / data) ===
             currentSearchTask = Task.detached(priority: .userInitiated) {
                 let bgContext = ModelContext(container)
                 var resultIDSet = Set<PersistentIdentifier>()
@@ -114,16 +202,17 @@ struct ContentView: View {
                 func appendIfNeeded(_ id: PersistentIdentifier) {
                     if resultIDSet.insert(id).inserted { resultIDs.append(id) }
                 }
-                let isTextSearch = !text.isEmpty
                 
-                // Helper: sprawdza pozostałe filtry na obiektach już załadowanych
-                func matchesAllFilters(_ p: PhotoAsset) -> Bool {
-                    if let hex = hexColor {
-                        let hexLow = hex.lowercased()
-                        let fHex = p.folder?.colorHex?.lowercased()
-                        let eHex = p.event?.colorHex?.lowercased()
-                        let pHex = p.colorLabel?.lowercased()
-                        if fHex != hexLow && eHex != hexLow && pHex != hexLow { return false }
+                func matchesAllFilters(_ p: PhotoAsset, skipText: Bool = false) -> Bool {
+                    if !hexColors.isEmpty {
+                        let pHex = (p.colorLabel ?? "").lowercased()
+                        let fHex = (p.folder?.colorHex ?? "").lowercased()
+                        let eHex = (p.event?.colorHex ?? "").lowercased()
+                        let ok = hexColors.contains(where: { h in
+                            let hLow = h.lowercased()
+                            return pHex == hLow || fHex == hLow || eHex == hLow
+                        })
+                        if !ok { return false }
                     }
                     if !ratings.isEmpty && !ratings.contains(p.rating) { return false }
                     if !date.isEmpty {
@@ -132,7 +221,7 @@ struct ContentView: View {
                         let t3 = p.event?.virtualDateString?.lowercased() ?? ""
                         if !t1.contains(date) && !t2.contains(date) && !t3.contains(date) { return false }
                     }
-                    if isTextSearch {
+                    if !skipText && isTextSearch {
                         let mName = p.fileName.lowercased().contains(text)
                         let mDesc = p.imageDescription.lowercased().contains(text)
                         let mKey = p.keywords.contains { $0.lowercased().contains(text) }
@@ -141,10 +230,6 @@ struct ContentView: View {
                     return true
                 }
                 
-                // ================================================================
-                // ŚCIEŻKA 1: SQL po OCENIE — WHERE rating = N  (ultra szybka!)
-                // Zamiast ładować 10 000 zdjęć: SQL zwraca tylko te z daną oceną.
-                // ================================================================
                 if !ratings.isEmpty {
                     for ratingVal in ratings {
                         if resultIDs.count >= 200 || Task.isCancelled { break }
@@ -152,7 +237,7 @@ struct ContentView: View {
                         let pred: Predicate<PhotoAsset> = isVIPOnly
                             ? #Predicate<PhotoAsset> { $0.isTrash == false && $0.isVIP == true && $0.rating == r }
                             : #Predicate<PhotoAsset> { $0.isTrash == false && $0.rating == r }
-                        var desc = FetchDescriptor<PhotoAsset>(predicate: pred)
+                        var desc = FetchDescriptor<PhotoAsset>(predicate: pred, sortBy: [SortDescriptor(\.fileName)])
                         desc.fetchLimit = 200
                         if let fetched = try? bgContext.fetch(desc) {
                             for p in fetched {
@@ -164,49 +249,44 @@ struct ContentView: View {
                     }
                 }
                 
-                // ================================================================
-                // ŚCIEŻKA 2: SQL po KOLORZE — colorLabel + reverse lookup folder/event
-                // ================================================================
-                if let hex = hexColor, resultIDs.count < 200 {
-                    // Photo-level colorLabel (SQL)
-                    let labelPred = #Predicate<PhotoAsset> { $0.isTrash == false && $0.colorLabel == hex }
-                    var labelDesc = FetchDescriptor<PhotoAsset>(predicate: labelPred)
-                    labelDesc.fetchLimit = 200
-                    if let fetched = try? bgContext.fetch(labelDesc) {
-                        for p in fetched {
-                            if Task.isCancelled { return }
-                            if matchesAllFilters(p) { appendIfNeeded(p.persistentModelID) }
-                            if resultIDs.count >= 200 { break }
+                if !hexColors.isEmpty && resultIDs.count < 200 {
+                    for hex in hexColors {
+                        if Task.isCancelled || resultIDs.count >= 200 { break }
+                        let pred = #Predicate<PhotoAsset> { photo in
+                            photo.isTrash == false && photo.colorLabel == hex
                         }
-                    }
-                    // Folder colorHex → photos
-                    let folderPred = #Predicate<VirtualFolder> { $0.colorHex == hex }
-                    if let folders = try? bgContext.fetch(FetchDescriptor<VirtualFolder>(predicate: folderPred)) {
-                        for folder in folders {
-                            if resultIDs.count >= 200 || Task.isCancelled { break }
-                            for photo in folder.photos where !photo.isTrash {
-                                if matchesAllFilters(photo) { appendIfNeeded(photo.persistentModelID) }
+                        var labelDesc = FetchDescriptor<PhotoAsset>(predicate: pred, sortBy: [SortDescriptor(\.fileName)])
+                        labelDesc.fetchLimit = 200
+                        if let fetched = try? bgContext.fetch(labelDesc) {
+                            for p in fetched {
+                                if Task.isCancelled { return }
+                                if matchesAllFilters(p) { appendIfNeeded(p.persistentModelID) }
                                 if resultIDs.count >= 200 { break }
                             }
                         }
-                    }
-                    // Event colorHex → photos
-                    let eventPred = #Predicate<EventFolder> { $0.colorHex == hex }
-                    if let events = try? bgContext.fetch(FetchDescriptor<EventFolder>(predicate: eventPred)) {
-                        for event in events {
-                            if resultIDs.count >= 200 || Task.isCancelled { break }
-                            for photo in event.photos where !photo.isTrash {
-                                if matchesAllFilters(photo) { appendIfNeeded(photo.persistentModelID) }
-                                if resultIDs.count >= 200 { break }
+                        let folderPred = #Predicate<VirtualFolder> { $0.colorHex == hex }
+                        if let folders = try? bgContext.fetch(FetchDescriptor<VirtualFolder>(predicate: folderPred)) {
+                            for folder in folders {
+                                if resultIDs.count >= 200 || Task.isCancelled { break }
+                                for photo in folder.photos where !photo.isTrash {
+                                    if matchesAllFilters(photo) { appendIfNeeded(photo.persistentModelID) }
+                                    if resultIDs.count >= 200 { break }
+                                }
+                            }
+                        }
+                        let eventPred = #Predicate<EventFolder> { $0.colorHex == hex }
+                        if let events = try? bgContext.fetch(FetchDescriptor<EventFolder>(predicate: eventPred)) {
+                            for event in events {
+                                if resultIDs.count >= 200 || Task.isCancelled { break }
+                                for photo in event.photos where !photo.isTrash {
+                                    if matchesAllFilters(photo) { appendIfNeeded(photo.persistentModelID) }
+                                    if resultIDs.count >= 200 { break }
+                                }
                             }
                         }
                     }
                 }
                 
-                // ================================================================
-                // ŚCIEŻKA 3: SQL po OSOBACH — Person.name → person.photos
-                // Dokładne dopasowanie nazwy, bez skanowania zdjęć po stronie foto.
-                // ================================================================
                 if isTextSearch && resultIDs.count < 200 {
                     let personPredicate = #Predicate<Person> {
                         $0.name.localizedStandardContains(text) ||
@@ -223,15 +303,7 @@ struct ContentView: View {
                                   (!lastLow.isEmpty && lastLow.contains(text)) else { continue }
                             if Task.isCancelled { return }
                             for photo in person.photos where !photo.isTrash {
-                                var ok = true
-                                if let hex = hexColor {
-                                    let fHex = photo.folder?.colorHex?.lowercased()
-                                    let eHex = photo.event?.colorHex?.lowercased()
-                                    let pHex = photo.colorLabel?.lowercased()
-                                    if fHex != hex && eHex != hex && pHex != hex { ok = false }
-                                }
-                                if ok && !ratings.isEmpty && !ratings.contains(photo.rating) { ok = false }
-                                if ok { appendIfNeeded(photo.persistentModelID) }
+                                if matchesAllFilters(photo, skipText: true) { appendIfNeeded(photo.persistentModelID) }
                                 if resultIDs.count >= 200 { break }
                             }
                             if resultIDs.count >= 200 { break }
@@ -239,21 +311,18 @@ struct ContentView: View {
                     }
                 }
                 
-                // ================================================================
-                // ŚCIEŻKA 4: Skan tekstowy (filename/description/keywords) + data
-                // Jedyna ścieżka wymagająca skanowania w pamięci.
-                // fetchLimit=2000 tylko dla tekstu; filtr daty skanuje całość (rzadkie).
-                // ================================================================
+                let colorNeedsBackup = !hexColors.isEmpty && resultIDs.isEmpty
                 let needScan = resultIDs.count < 200 && (
                     isTextSearch ||
-                    (!date.isEmpty && ratings.isEmpty && hexColor == nil)
+                    (!date.isEmpty && ratings.isEmpty && hexColors.isEmpty) ||
+                    colorNeedsBackup
                 )
                 if needScan {
                     let basePred: Predicate<PhotoAsset> = isVIPOnly
                         ? #Predicate<PhotoAsset> { $0.isTrash == false && $0.isVIP == true }
                         : #Predicate<PhotoAsset> { $0.isTrash == false }
-                    var descriptor = FetchDescriptor<PhotoAsset>(predicate: basePred)
-                    if isTextSearch { descriptor.fetchLimit = 2000 }
+                    var descriptor = FetchDescriptor<PhotoAsset>(predicate: basePred, sortBy: [SortDescriptor(\.fileName)])
+                    descriptor.fetchLimit = 2000
                     if let fetched = try? bgContext.fetch(descriptor) {
                         for p in fetched {
                             if Task.isCancelled { return }
@@ -284,25 +353,31 @@ struct ContentView: View {
         if selectedNavItems.count == 1, let item = selectedNavItems.first {
             switch item {
             case .allPhotos:
-                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false }); desc.fetchLimit = 200
+                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false }, sortBy: [SortDescriptor(\.fileName)])
+                desc.fetchLimit = 200
                 displayPhotos = (try? modelContext.fetch(desc)) ?? []
             case .vipPhotos:
-                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.isVIP == true }); desc.fetchLimit = 500
+                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.isVIP == true }, sortBy: [SortDescriptor(\.fileName)])
+                desc.fetchLimit = 500
                 displayPhotos = (try? modelContext.fetch(desc)) ?? []
             case .folder(let f): displayPhotos = f.photosRecursively(limit: 200)
             case .event(let e): displayPhotos = e.photosRecursively(limit: 200)
             case .trash: displayPhotos = trashedPhotos
             case .reviewAll:
-                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory != nil }); desc.fetchLimit = 200
+                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory != nil }, sortBy: [SortDescriptor(\.fileName)])
+                desc.fetchLimit = 200
                 displayPhotos = (try? modelContext.fetch(desc)) ?? []
             case .reviewDocs:
-                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory == "Dokumenty" }); desc.fetchLimit = 200
+                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory == "Dokumenty" }, sortBy: [SortDescriptor(\.fileName)])
+                desc.fetchLimit = 200
                 displayPhotos = (try? modelContext.fetch(desc)) ?? []
             case .reviewDupes:
-                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory == "Duplikaty" }); desc.fetchLimit = 200
+                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory == "Duplikaty" }, sortBy: [SortDescriptor(\.fileName)])
+                desc.fetchLimit = 200
                 displayPhotos = (try? modelContext.fetch(desc)) ?? []
             case .reviewOther:
-                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory != nil && $0.reviewCategory != "Dokumenty" && $0.reviewCategory != "Duplikaty" }); desc.fetchLimit = 200
+                var desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false && $0.reviewCategory != nil && $0.reviewCategory != "Dokumenty" && $0.reviewCategory != "Duplikaty" }, sortBy: [SortDescriptor(\.fileName)])
+                desc.fetchLimit = 200
                 displayPhotos = (try? modelContext.fetch(desc)) ?? []
             default: displayPhotos = []
             }
@@ -331,7 +406,7 @@ struct ContentView: View {
             loadPhotosFromDatabase()
         }
         .onChange(of: activeSearchColorHex) { _, newVal in
-            if newVal != nil { navigateToMainIfOnSpecialView() }
+            if !newVal.isEmpty { navigateToMainIfOnSpecialView() }
             loadPhotosFromDatabase()
         }
         .onChange(of: activeRatings) { _, newVal in
@@ -395,7 +470,7 @@ struct ContentView: View {
         if isPeopleTab {
             if let item = selectedNavItems.first { switch item { case .peopleTop100: PeopleView(filterMode: .top100, searchKeywords: $searchKeywords, selectedNavItems: $selectedNavItems, activeSearchText: $activeSearchText); case .peopleOther: PeopleView(filterMode: .other, searchKeywords: $searchKeywords, selectedNavItems: $selectedNavItems, activeSearchText: $activeSearchText); case .peopleUnnamed: PeopleView(filterMode: .unnamed, searchKeywords: $searchKeywords, selectedNavItems: $selectedNavItems, activeSearchText: $activeSearchText); default: EmptyView() } }
         } else if selectedNavItems.count == 1, selectedNavItems.first == .keywords {
-            KeywordsView(globalSelectedPhotos: .constant([]), searchKeywords: $searchKeywords)
+            KeywordsView(globalSelectedPhotos: .constant([]), searchKeywords: $searchKeywords, selectedNavItems: $selectedNavItems, activeSearchText: $activeSearchText)
         } else {
             WorkspaceView(
                 photos: displayPhotos, jobState: jobState, selectedNavItems: $selectedNavItems,
@@ -470,15 +545,13 @@ struct ContentView: View {
             let hasExisting = photos.contains { $0.isFaceScanned }
             if hasExisting {
                 pendingFacePhotos = photos
-                // 🚨 Świeże, wiarygodne policzenie twarzy - bezpośrednie odczytanie photo.faceCrops.count
-                // może pokazać nieaktualną (np. zerową) wartość, jeśli obiekt był wcześniej wczytany
-                // do pamięci zanim skaner w tle dopisał twarze. Dlatego liczymy na nowo wprost z bazy.
                 let ids = Set(photos.map { $0.id })
+                var cropCount = 0
                 if let allCrops = try? modelContext.fetch(FetchDescriptor<FaceCrop>()) {
-                    pendingFaceCount = allCrops.filter { crop in if let pid = crop.photo?.id { return ids.contains(pid) }; return false }.count
-                } else {
-                    pendingFaceCount = 0
+                    cropCount = allCrops.filter { crop in if let pid = crop.photo?.id { return ids.contains(pid) }; return false }.count
                 }
+                let peopleCount = photos.reduce(0) { $0 + $1.people.count }
+                pendingFaceCount = max(cropCount, peopleCount)
                 showingFaceOverwriteAlert = true
                 return
             }
@@ -517,8 +590,6 @@ struct ContentView: View {
         }
     }
     
-    /// Przenosi nawigację do Wszystkich zdjęć gdy użytkownik jest w widoku Słów kluczowych
-    /// lub Osoby i aktywuje globalny filtr (ocena/kolor/VIP/tekst/data).
     private func navigateToMainIfOnSpecialView() {
         guard let current = selectedNavItems.first else { return }
         switch current {
@@ -528,20 +599,106 @@ struct ContentView: View {
             break
         }
     }
-    @ViewBuilder private func folderRowView(for folder: VirtualFolder) -> some View { HStack { Image(systemName: "folder.fill").foregroundStyle(colorFromHex(folder.colorHex)); Text(folder.name) }.tag(NavigationItem.folder(folder)).dropDestination(for: String.self) { _, _ in return false }.contextMenu { Button("Zmień nazwę...") { itemToRename = .folder(folder); renameText = folder.name; showingRenameAlert = true }; Button(role: .destructive) { modelContext.delete(folder); try? modelContext.save() } label: { Label("Usuń album", systemImage: "trash") } } }
-    @ViewBuilder private func eventRowView(for event: EventFolder) -> some View { HStack { Image(systemName: "calendar").foregroundStyle(event.colorHex != nil ? colorFromHex(event.colorHex) : (event.generatedAutomatically ? .purple : .green)); Text(event.name) }.tag(NavigationItem.event(event)).draggable("event:\(event.id.uuidString)").dropDestination(for: String.self) { _, _ in return false }.contextMenu { Button("Dodaj wydarzenie...") { newRootEventName = ""; showingCreateRootEventAlert = true }; Button("Zmień nazwę...") { itemToRename = .event(event); renameText = event.name; showingRenameAlert = true }; Button(role: .destructive) { modelContext.delete(event); try? modelContext.save() } label: { Label("Usuń", systemImage: "trash") } } }
+    
     private func colorFromHex(_ hex: String?) -> Color { guard let hex = hex, hex.hasPrefix("#") else { return .accentColor }; let start = hex.index(hex.startIndex, offsetBy: 1); if String(hex[start...]).count == 6 { let s = Scanner(string: String(hex[start...])); var n: UInt64 = 0; if s.scanHexInt64(&n) { return Color(red: Double((n & 0xff0000) >> 16) / 255, green: Double((n & 0x00ff00) >> 8) / 255, blue: Double(n & 0x0000ff) / 255) } }; return .accentColor }
+    
+    // ==========================================
+    // MENU KONTEKSTOWE DLA DRZEWA (FOLDERY / WYDARZENIA)
+    // ==========================================
+    @ViewBuilder private func folderRowView(for folder: VirtualFolder) -> some View { 
+        HStack { Image(systemName: "folder.fill").foregroundStyle(colorFromHex(folder.colorHex)); Text(folder.name) }
+            .tag(NavigationItem.folder(folder))
+            .dropDestination(for: String.self) { _, _ in return false }
+            .contextMenu { 
+                Menu("Skanuj twarze (Folder)...") {
+                    Button("Tylko brakujące") {
+                        let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash && !$0.isFaceScanned }
+                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: false) }
+                    }
+                    Button("Napraw pominięte (Brak twarzy)") {
+                        let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash && $0.isFaceScanned && $0.faceCrops.isEmpty }
+                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
+                    }
+                    Button("Skanuj WSZYSTKO (Nadpisz)") {
+                        let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash }
+                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
+                    }
+                }
+                Menu("Opisy AI - Gemini (Folder)...") {
+                    Button("Tylko brakujące") {
+                        let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash && !$0.isAiScanned }
+                        if !toScan.isEmpty { requestAIScan(photos: toScan, force: false) }
+                    }
+                    Button("Skanuj WSZYSTKO (Nadpisz)") {
+                        let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash }
+                        if !toScan.isEmpty { requestAIScan(photos: toScan, force: true) }
+                    }
+                }
+                Divider()
+                Button("Zmień nazwę...") { itemToRename = .folder(folder); renameText = folder.name; showingRenameAlert = true }
+                Button(role: .destructive) { modelContext.delete(folder); try? modelContext.save() } label: { Label("Usuń album", systemImage: "trash") } 
+            } 
+    }
+    
+    @ViewBuilder private func eventRowView(for event: EventFolder) -> some View { 
+        HStack { Image(systemName: "calendar").foregroundStyle(event.colorHex != nil ? colorFromHex(event.colorHex) : (event.generatedAutomatically ? .purple : .green)); Text(event.name) }
+            .tag(NavigationItem.event(event))
+            .draggable("event:\(event.id.uuidString)")
+            .dropDestination(for: String.self) { _, _ in return false }
+            .contextMenu { 
+                Menu("Skanuj twarze (Wydarzenie)...") {
+                    Button("Tylko brakujące") {
+                        let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash && !$0.isFaceScanned }
+                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: false) }
+                    }
+                    Button("Napraw pominięte (Brak twarzy)") {
+                        let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash && $0.isFaceScanned && $0.faceCrops.isEmpty }
+                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
+                    }
+                    Button("Skanuj WSZYSTKO (Nadpisz)") {
+                        let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash }
+                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
+                    }
+                }
+                Menu("Opisy AI - Gemini (Wydarzenie)...") {
+                    Button("Tylko brakujące") {
+                        let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash && !$0.isAiScanned }
+                        if !toScan.isEmpty { requestAIScan(photos: toScan, force: false) }
+                    }
+                    Button("Skanuj WSZYSTKO (Nadpisz)") {
+                        let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash }
+                        if !toScan.isEmpty { requestAIScan(photos: toScan, force: true) }
+                    }
+                }
+                Divider()
+                Button("Dodaj wydarzenie...") { newRootEventName = ""; showingCreateRootEventAlert = true }
+                Button("Zmień nazwę...") { itemToRename = .event(event); renameText = event.name; showingRenameAlert = true }
+                Button(role: .destructive) { modelContext.delete(event); try? modelContext.save() } label: { Label("Usuń", systemImage: "trash") } 
+            } 
+    }
 }
 
 struct CustomTopSearchBar: View {
-    @Binding var activeSearchText: String; @Binding var activeSearchDate: String; @Binding var activeSearchVIP: Bool; @Binding var activeSearchColorHex: String?; @Binding var activeRatings: Set<Int>
+    @Binding var activeSearchText: String; @Binding var activeSearchDate: String; @Binding var activeSearchVIP: Bool; @Binding var activeSearchColorHex: Set<String>; @Binding var activeRatings: Set<Int>
     @State private var draftSearchText: String = ""; @State private var draftSearchDate: String = ""
     let colorFilters = [ ("Czerwony", "#FF3B30", Color.red), ("Niebieski", "#007AFF", Color.blue), ("Zielony", "#34C759", Color.green), ("Pomarańczowy", "#FF9500", Color.orange), ("Fioletowy", "#AF52DE", Color.purple) ]
     var body: some View {
         HStack(spacing: 16) {
-            HStack(spacing: 8) {
+            HStack(spacing: 4) {
                 ForEach(colorFilters, id: \.1) { name, hex, color in
-                    Circle().fill(color).frame(width: 14, height: 14).overlay(Circle().stroke(Color.primary.opacity(0.8), lineWidth: activeSearchColorHex == hex ? 2 : 0)).padding(2).onTapGesture { activeSearchColorHex = (activeSearchColorHex == hex) ? nil : hex }.help("Filtruj tag: \(name)")
+                    Circle().fill(color).frame(width: 14, height: 14)
+                        .overlay(Circle().stroke(Color.primary.opacity(0.8), lineWidth: activeSearchColorHex.contains(hex) ? 2 : 0))
+                        .padding(2)
+                        .onTapGesture {
+                            if activeSearchColorHex.contains(hex) { activeSearchColorHex.remove(hex) }
+                            else { activeSearchColorHex.insert(hex) }
+                        }
+                        .help(activeSearchColorHex.contains(hex) ? "Odznacz: \(name)" : "Filtruj: \(name)")
+                }
+                if !activeSearchColorHex.isEmpty {
+                    Button(action: { activeSearchColorHex.removeAll() }) {
+                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary).font(.caption)
+                    }.buttonStyle(.plain).padding(.leading, 2).help("Wyczyść filtry kolorów")
                 }
             }
             Text("|").foregroundColor(.secondary.opacity(0.4))
@@ -611,7 +768,6 @@ struct WorkspaceView: View {
     @State private var showingNewEventAlert = false
     @State private var newEventName = ""
     
-    // 🚨 REGISTRACJA STANÓW DLA KOPII ZAPASOWEJ (Poprawna obsługa Backupu!)
     @State private var showingBackupSheet = false
     @State private var backupManager = BackupManager.shared
     
@@ -619,14 +775,12 @@ struct WorkspaceView: View {
         ZStack {
             Button("") { guard !selectedPhotos.isEmpty else { return }; for p in selectedPhotos { p.isVIP.toggle() }; try? modelContext.save() }
                 .keyboardShortcut(.space, modifiers: []).frame(width: 0, height: 0).opacity(0)
-            // Skróty klawiszowe 1–6 do ustawiania oceny zaznaczonych zdjęć
             ForEach(1...6, id: \.self) { score in
                 Button("") { guard !selectedPhotos.isEmpty else { return }; let allSame = selectedPhotos.allSatisfy { $0.rating == score }; for p in selectedPhotos { p.rating = allSame ? 0 : score }; try? modelContext.save() }
                     .keyboardShortcut(KeyEquivalent(Character("\(score)")), modifiers: []).frame(width: 0, height: 0).opacity(0)
             }
             VStack(spacing: 0) {
                 
-                // 🚨 BANER INFORMACYJNY KOPII ZAPASOWEJ
                 if backupManager.isBackupRequired && hasAnyPhoto {
                     HStack {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -659,9 +813,7 @@ struct WorkspaceView: View {
             }
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    // 🚨 PRZYCISK KOPII ZAPASOWEJ W TOOLBARZE
                     Button(action: { showingBackupSheet = true }) { Label("Kopia zapasowa", systemImage: "archivebox") }.disabled(jobState.isActive).help("Wykonaj kopię zapasową całego systemu")
-                    
                     Button(action: onAISettingsToolbar) { Label("Ustawienia AI", systemImage: "cpu") }.disabled(jobState.isActive).help("Panel klucza API")
                     Button(action: onImportFolder) { Label("Importuj folder", systemImage: "folder.badge.plus") }.disabled(jobState.isActive).help("Importuj folder")
                     Button(action: onAIGlobalToolbar) { Label("Opisz wszystkie (AI)", systemImage: "wand.and.stars.inverse") }.disabled(jobState.isActive).help("Opisy, oceny i tagi AI")
@@ -673,10 +825,7 @@ struct WorkspaceView: View {
                 ToolbarItem(placement: .navigation) { Button(action: { isInspectorPresented.toggle() }) { Label("Inspektor", systemImage: "sidebar.right") }.disabled(isPeopleTab).help("Panel boczny") }
             }
             .sheet(isPresented: $showingAISettings) { AISettingsView() }
-            
-            // 🚨 PODPIĘCIE WIDOKU KOPII ZAPASOWEJ
             .sheet(isPresented: $showingBackupSheet) { BackupSheetView() }
-            
             .alert("Nowe wydarzenie", isPresented: $showingNewEventAlert) { TextField("Nazwa wydarzenia", text: $newEventName); Button("Anuluj", role: .cancel) { }; Button("Utwórz i przenieś") { guard !newEventName.isEmpty, !selectedPhotos.isEmpty else { return }; let newEvent = EventFolder(name: newEventName, generatedAutomatically: false); modelContext.insert(newEvent); for photo in selectedPhotos { photo.event = newEvent }; try? modelContext.save(); selectedNavItems = [.event(newEvent)]; selectedPhotos.removeAll() } }
             .alert("Kreator Opisów AI", isPresented: $showingGlobalAIAlert) {
                 Button("Tylko brakujące") { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isAiScanned == false && $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanAI(toScan, false) } else { jobState.progressStatus = "✅ Brak nowych zdjęć do opisu!"; jobState.isScanning = true; Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false } } }
@@ -708,12 +857,8 @@ struct WorkspaceView: View {
             .task { checkDatabaseState() }
             .onChange(of: photos) { _, newPhotos in
                 checkDatabaseState()
-                // Wyczyść zaznaczenie z zdjęć które zniknęły z listy
-                // (np. po zmianie filtra kolor/ocena/nawigacja do innego albumu)
-                if !selectedPhotos.isEmpty {
-                    let visible = Set(newPhotos.map { $0.id })
-                    selectedPhotos = selectedPhotos.filter { visible.contains($0.id) }
-                }
+                let visible = Set(newPhotos.map { $0.id })
+                selectedPhotos = selectedPhotos.filter { visible.contains($0.id) }
             }
         }
     }
@@ -755,7 +900,6 @@ struct PhotoCellView: View {
     let isSelected: Bool
     @State private var loadedImage: NSImage?
     
-    // Kolor ramki: zaznaczenie > etykieta koloru > brak
     private var borderColor: Color {
         if isSelected { return Color.accentColor }
         if let hex = photo.colorLabel { return colorFromHex(hex) }
@@ -768,8 +912,10 @@ struct PhotoCellView: View {
             ZStack(alignment: .topTrailing) {
                 if let nsImage = loadedImage {
                     Image(nsImage: nsImage)
-                        .resizable().scaledToFill()
-                        .frame(width: 150, height: 150).clipped().cornerRadius(8)
+                        .resizable().scaledToFit()
+                        .frame(width: 150, height: 150)
+                        .background(Color.secondary.opacity(0.08))
+                        .cornerRadius(8)
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(borderColor, lineWidth: borderWidth))
                         .opacity(photo.isTrash ? 0.5 : 1.0)
                 } else {
@@ -778,7 +924,6 @@ struct PhotoCellView: View {
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(borderColor, lineWidth: borderWidth))
                         .task(id: photo.id) { await loadThumbnail() }
                 }
-                // Ikony w rogu
                 VStack(alignment: .trailing, spacing: 2) {
                     if photo.isVIP {
                         Image(systemName: "star.fill").foregroundColor(.yellow).shadow(radius: 2).padding(.top, 6).padding(.trailing, 6)
@@ -821,21 +966,13 @@ struct PhotoGridView: View {
 
 struct PhotoInspectorView: View {
     @Environment(\.modelContext) private var modelContext; @Bindable var photo: PhotoAsset; @Binding var searchKeywords: Set<String>; @Binding var selectedNavItems: Set<NavigationItem>; @Binding var searchText: String; var onScanAI: ([PhotoAsset], Bool) -> Void; var onExport: (PhotoAsset) -> Void; @State private var metadata: PhotoMetadata?; @State private var localSelectedKeywords: Set<String> = []; @State private var coordinate: CLLocationCoordinate2D?; @State private var isXMPExpanded: Bool = false
-    // 🚨 KLUCZOWA POPRAWKA: @Query to WŁAŚCIWY, wbudowany mechanizm SwiftData, który
-    // SAM automatycznie odświeża się przy KAŻDEJ zmianie w bazie (nawet zapisanej przez inny
-    // kontekst w tle, np. skaner). W przeciwieństwie do ręcznego `context.fetch()` czy
-    // odczytu relacji na już wczytanym obiekcie, @Query NIGDY nie pokazuje "znikających po chwili"
-    // nieaktualnych danych - to definitywnie rozwiązuje problem z tagami Osób.
     @Query private var allPeopleQuery: [Person]
     
     private var peopleTags: [String] {
-        // photo.people jest ustawiane jawnie w głównym kontekście przez ScannerService po każdym skanie.
-        // @Bindable reaguje na zmiany, więc widok odświeży się automatycznie.
         let fromRelation = photo.people.map { $0.name }
         if !fromRelation.isEmpty {
             return Array(Set(fromRelation)).sorted()
         }
-        // Fallback: sprawdź przez @Query (dla starszych danych lub przypadków granicznych)
         let pid = photo.id
         var names: Set<String> = []
         for person in allPeopleQuery {
@@ -844,7 +981,7 @@ struct PhotoInspectorView: View {
         return Array(names).sorted()
     }
 
-    var body: some View { Form { Section("Plik") { LabeledContent("Nazwa", value: photo.fileName); Text(photo.originalPath).font(.caption2).foregroundStyle(.secondary); Button(action: { onExport(photo) }) { Label("Eksportuj na dysk...", systemImage: "square.and.arrow.up") } }; Section("Inteligentna Analiza") { Button(action: { onScanAI([photo], true) }) { HStack { Image(systemName: "wand.and.stars"); Text(photo.imageDescription.isEmpty ? "Wygeneruj opis i tagi (AI)" : "Przeanalizuj ponownie (AI)") } }.buttonStyle(.plain).foregroundColor(.accentColor) }; let keywordTags = Array(Set(photo.keywords).subtracting(peopleTags)).sorted(); if photo.isAiScanned || photo.isFaceScanned || !photo.imageDescription.isEmpty || !keywordTags.isEmpty || !peopleTags.isEmpty || !photo.faceCrops.isEmpty { Section("Dane w programie") { if photo.isAiScanned || photo.rating > 0 { VStack(alignment: .leading, spacing: 6) { Text("Ocena").font(.caption).foregroundColor(.secondary); HStack(spacing: 4) { ForEach(1...6, id: \.self) { score in Button(action: { photo.rating = (photo.rating == score) ? 0 : score; try? modelContext.save() }) { Text("\(score)").font(.caption2.bold()).frame(width: 22, height: 22).background(score <= photo.rating ? Color.accentColor : Color.secondary.opacity(0.2)).foregroundColor(score <= photo.rating ? .white : .primary).cornerRadius(5) }.buttonStyle(.plain).help("Ocena \(score)/6\(photo.rating == score ? " (kliknij aby wyczyścić)" : "")") } } } }; if !peopleTags.isEmpty || !keywordTags.isEmpty { FlowLayout(spacing: 6) { ForEach(peopleTags, id: \.self) { kw in Button(action: { searchText = kw; selectedNavItems = [.allPhotos] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.blue).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) }; ForEach(keywordTags, id: \.self) { kw in Button(action: { searchText = ""; searchKeywords = [kw]; selectedNavItems = [.keywords] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.green).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4) }; if !photo.imageDescription.isEmpty { Text(photo.imageDescription).font(.callout) } } }; Section("Lokalizacja w bibliotece") { HStack { Image(systemName: "calendar").foregroundColor(photo.event?.colorHex != nil ? colorFromHex(photo.event?.colorHex) : .accentColor); LabeledContent("Wydarzenie", value: photo.event?.name ?? "Brak") }; HStack { Image(systemName: "folder.fill").foregroundColor(photo.folder?.colorHex != nil ? colorFromHex(photo.folder?.colorHex) : .accentColor); LabeledContent("Album", value: photo.folder?.name ?? "Brak") } }; Section("Status VIP") { Toggle(isOn: $photo.isVIP) { Label("Oznacz jako VIP", systemImage: photo.isVIP ? "star.fill" : "star").foregroundColor(photo.isVIP ? .yellow : .primary) } }; Section("Kolor etykiety") { HStack(spacing: 8) { ForEach([(hex: "#FF3B30", color: Color.red), (hex: "#007AFF", color: Color.blue), (hex: "#34C759", color: Color.green), (hex: "#FF9500", color: Color.orange), (hex: "#AF52DE", color: Color.purple)], id: \.hex) { item in let isActive = photo.colorLabel?.lowercased() == item.hex.lowercased(); Button(action: { photo.colorLabel = isActive ? nil : item.hex; try? modelContext.save() }) { Circle().fill(item.color).frame(width: 22, height: 22).overlay(Circle().stroke(Color.primary, lineWidth: isActive ? 2.5 : 0).padding(1)) }.buttonStyle(.plain).help(isActive ? "Usuń etykietę koloru" : "Ustaw etykietę") }; if photo.colorLabel != nil { Button(action: { photo.colorLabel = nil; try? modelContext.save() }) { Image(systemName: "xmark.circle").foregroundColor(.secondary) }.buttonStyle(.plain).help("Usuń etykietę koloru") } } }; if let coord = coordinate { Section("Geolokalizacja (GPS)") { Map(initialPosition: .region(MKCoordinateRegion(center: coord, span: MKCoordinateSpan(latitudeDelta: 0.05, longitudeDelta: 0.05)))) { Marker(photo.fileName, coordinate: coord) }.frame(height: 200).cornerRadius(8).padding(.vertical, 4) } }; if let meta = metadata { Section { DisclosureGroup(isExpanded: $isXMPExpanded) { if !meta.xmpKeywords.isEmpty { FlowLayout(spacing: 6) { ForEach(Array(Set(meta.xmpKeywords)).sorted(), id: \.self) { kw in Button(action: { if localSelectedKeywords.contains(kw) { localSelectedKeywords.remove(kw) } else { localSelectedKeywords.insert(kw) } }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(localSelectedKeywords.contains(kw) ? Color.accentColor : Color.secondary.opacity(0.2)).foregroundColor(localSelectedKeywords.contains(kw) ? .white : .primary).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4); if !localSelectedKeywords.isEmpty { Button(action: { searchText = ""; searchKeywords = localSelectedKeywords; selectedNavItems = [.keywords] }) { HStack { Image(systemName: "magnifyingglass"); Text("Szukaj powiązanych (\(localSelectedKeywords.count))") }.font(.callout.bold()).foregroundColor(.accentColor) }.buttonStyle(.plain).padding(.top, 4) } } else { Text("Brak pliku XMP / tagów").foregroundStyle(.secondary) }; if let desc = meta.xmpDescription { Divider(); Text(desc).font(.callout) } } label: { Text("Odczyt z pliku na dysku (.xmp)").font(.headline) } } } else { ProgressView("Wczytywanie XMP...") }; Section("Ustawienia systemowe") { TextField("Wirtualna Data", text: Binding(get: { photo.virtualDateString ?? "" }, set: { photo.virtualDateString = $0.isEmpty ? nil : $0 })) } }.formStyle(.grouped).navigationTitle("Szczegóły Zdjęcia").onChange(of: photo.id) { _, _ in localSelectedKeywords.removeAll(); coordinate = nil; isXMPExpanded = false }.task(id: photo.id) { loadData() } }
+    var body: some View { Form { Section("Plik") { LabeledContent("Nazwa", value: photo.fileName); Text(photo.originalPath).font(.caption2).foregroundStyle(.secondary); Button(action: { onExport(photo) }) { Label("Eksportuj na dysk...", systemImage: "square.and.arrow.up") } }; Section("Inteligentna Analiza") { Button(action: { onScanAI([photo], true) }) { HStack { Image(systemName: "wand.and.stars"); Text(photo.imageDescription.isEmpty ? "Wygeneruj opis i tagi (AI)" : "Przeanalizuj ponownie (AI)") } }.buttonStyle(.plain).foregroundColor(.accentColor) }; let keywordTags = Array(Set(photo.keywords).subtracting(peopleTags)).sorted(); if photo.isAiScanned || photo.isFaceScanned || !photo.imageDescription.isEmpty || !keywordTags.isEmpty || !peopleTags.isEmpty || !photo.faceCrops.isEmpty { Section("Dane w programie") { if photo.isAiScanned || photo.rating > 0 { VStack(alignment: .leading, spacing: 6) { Text("Ocena").font(.caption).foregroundColor(.secondary); HStack(spacing: 4) { ForEach(1...6, id: \.self) { score in Button(action: { photo.rating = (photo.rating == score) ? 0 : score; try? modelContext.save() }) { Text("\(score)").font(.caption2.bold()).frame(width: 22, height: 22).background(score <= photo.rating ? Color.accentColor : Color.secondary.opacity(0.2)).foregroundColor(score <= photo.rating ? .white : .primary).cornerRadius(5) }.buttonStyle(.plain).help("Ocena \(score)/6\(photo.rating == score ? " (kliknij aby wyczyścić)" : "")") } } } }; if !peopleTags.isEmpty || !keywordTags.isEmpty { FlowLayout(spacing: 6) { ForEach(peopleTags, id: \.self) { kw in Button(action: { searchText = ""; searchKeywords = [kw]; selectedNavItems = [.keywords] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.blue).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) }; ForEach(keywordTags, id: \.self) { kw in Button(action: { searchText = ""; searchKeywords = [kw]; selectedNavItems = [.keywords] }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(Color.green).foregroundColor(.white).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4) }; if !photo.imageDescription.isEmpty { Text(photo.imageDescription).font(.callout) } } }; Section("Lokalizacja w bibliotece") { HStack { Image(systemName: "calendar").foregroundColor(photo.event?.eventDescription != nil ? .accentColor : .accentColor); LabeledContent("Wydarzenie", value: photo.event?.name ?? "Brak") }; HStack { Image(systemName: "folder.fill").foregroundColor(photo.folder?.colorHex != nil ? colorFromHex(photo.folder?.colorHex) : .accentColor); LabeledContent("Album", value: photo.folder?.name ?? "Brak") } }; Section("Status VIP") { Toggle(isOn: $photo.isVIP) { Label("Oznacz jako VIP", systemImage: photo.isVIP ? "star.fill" : "star").foregroundColor(photo.isVIP ? .yellow : .primary) } }; Section("Kolor etykiety") { HStack(spacing: 8) { ForEach([(hex: "#FF3B30", color: Color.red), (hex: "#007AFF", color: Color.blue), (hex: "#34C759", color: Color.green), (hex: "#FF9500", color: Color.orange), (hex: "#AF52DE", color: Color.purple)], id: \.hex) { item in let isActive = photo.colorLabel?.lowercased() == item.hex.lowercased(); Button(action: { photo.colorLabel = isActive ? nil : item.hex; try? modelContext.save() }) { Circle().fill(item.color).frame(width: 22, height: 22).overlay(Circle().stroke(Color.primary, lineWidth: isActive ? 2.5 : 0).padding(1)) }.buttonStyle(.plain).help(isActive ? "Usuń etykietę koloru" : "Ustaw etykietę") }; if photo.colorLabel != nil { Button(action: { photo.colorLabel = nil; try? modelContext.save() }) { Image(systemName: "xmark.circle").foregroundColor(.secondary) }.buttonStyle(.plain).help("Usuń etykietę koloru") } } }; if let coord = coordinate { Section("Geolokalizacja (GPS)") { Map(initialPosition: .region(MKCoordinateRegion(center: coord, span: MKCoordinateSpan(latitudeDelta: 0.05, longitudeDelta: 0.05)))) { Marker(photo.fileName, coordinate: coord) }.frame(height: 200).cornerRadius(8).padding(.vertical, 4) } }; if let meta = metadata { Section { DisclosureGroup(isExpanded: $isXMPExpanded) { if !meta.xmpKeywords.isEmpty { FlowLayout(spacing: 6) { ForEach(Array(Set(meta.xmpKeywords)).sorted(), id: \.self) { kw in Button(action: { if localSelectedKeywords.contains(kw) { localSelectedKeywords.remove(kw) } else { localSelectedKeywords.insert(kw) } }) { Text(kw).font(.caption2).padding(.horizontal, 8).padding(.vertical, 4).background(localSelectedKeywords.contains(kw) ? Color.accentColor : Color.secondary.opacity(0.2)).foregroundColor(localSelectedKeywords.contains(kw) ? .white : .primary).cornerRadius(8) }.buttonStyle(.plain) } }.padding(.vertical, 4); if !localSelectedKeywords.isEmpty { Button(action: { searchText = ""; searchKeywords = localSelectedKeywords; selectedNavItems = [.keywords] }) { HStack { Image(systemName: "magnifyingglass"); Text("Szukaj powiązanych (\(localSelectedKeywords.count))") }.font(.callout.bold()).foregroundColor(.accentColor) }.buttonStyle(.plain).padding(.top, 4) } } else { Text("Brak pliku XMP / tagów").foregroundStyle(.secondary) }; if let desc = meta.xmpDescription { Divider(); Text(desc).font(.callout) } } label: { Text("Odczyt z pliku na dysku (.xmp)").font(.headline) } } } else { ProgressView("Wczytywanie XMP...") }; Section("Ustawienia systemowe") { TextField("Wirtualna Data", text: Binding(get: { photo.virtualDateString ?? "" }, set: { photo.virtualDateString = $0.isEmpty ? nil : $0 })) } }.formStyle(.grouped).navigationTitle("Szczegóły Zdjęcia").onChange(of: photo.id) { _, _ in localSelectedKeywords.removeAll(); coordinate = nil; isXMPExpanded = false }.task(id: photo.id) { loadData() } }
 
     private func loadData() { let path = photo.originalPath; Task { self.metadata = await Task.detached { MetadataReader.readMetadata(from: path) }.value; self.coordinate = await Task.detached { self.extractGPS(from: path) }.value } }
     nonisolated private func extractGPS(from path: String) -> CLLocationCoordinate2D? { let url = URL(fileURLWithPath: path); guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any], let gps = properties[kCGImagePropertyGPSDictionary as String] as? [String: Any], let lat = gps[kCGImagePropertyGPSLatitude as String] as? Double, let latRef = gps[kCGImagePropertyGPSLatitudeRef as String] as? String, let lon = gps[kCGImagePropertyGPSLongitude as String] as? Double, let lonRef = gps[kCGImagePropertyGPSLongitudeRef as String] as? String else { return nil }; return CLLocationCoordinate2D(latitude: latRef == "S" ? -lat : lat, longitude: lonRef == "W" ? -lon : lon) }

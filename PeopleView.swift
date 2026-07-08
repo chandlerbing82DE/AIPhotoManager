@@ -172,47 +172,34 @@ struct PeopleView: View {
             var affectedPhotoIDs: Set<PersistentIdentifier> = []
             
             for p in targets {
-                // Zbieramy ID zdjęć powiązanych z tą osobą z obu źródeł:
-                // twarzy (FaceCrop.photo) i relacji (Person.photos)
                 for crop in p.faceCrops {
                     if let photoId = crop.photo?.persistentModelID { affectedPhotoIDs.insert(photoId) }
                 }
                 for photo in p.photos {
                     affectedPhotoIDs.insert(photo.persistentModelID)
                 }
-                // 🚨 EKSTREMALNA OPTYMALIZACJA ZOMBIAKÓW
-                // Nie dotykamy p.faceCrops! Skasowanie osoby aktywuje regułę bazy danych (deleteRule: .cascade)
-                // i ukryty silnik SQLite sam po cichu wymaże z dysku twarze. Przyspieszenie 100x!
                 bgCtx.delete(p)
                 deletedCount += 1
-                if deletedCount % 200 == 0 { try? bgCtx.save() } // Batching dla bezpieczeństwa RAMu
+                if deletedCount % 200 == 0 { try? bgCtx.save() }
             }
             try? bgCtx.save()
             
-            // 🚨 Po skasowaniu: zdjęcia, które nie mają już ŻADNEJ twarzy, przestają być oznaczone
-            // jako "skanowane" - dzięki temu przy ponownym skanie nie pojawi się mylący monit
-            // "znaleziono 0 twarzy", tylko program potraktuje je jak nigdy nieskanowane.
+            // 🚨 POPRAWKA: Wszystkie zdjęcia, którym usunęliśmy chociaż jedną twarz "z tła",
+            // oznaczamy jako nieskanowane w pełni (isFaceScanned = false), aby kolejny skan przyrostowy
+            // mógł poprawnie przeanalizować zdjęcie i dodać brakujące, wartościowe twarze.
             for photoId in affectedPhotoIDs {
                 guard let photo: PhotoAsset = bgCtx.registeredModel(for: photoId) ?? (try? bgCtx.model(for: photoId)) as? PhotoAsset else { continue }
-                if photo.faceCrops.isEmpty {
-                    photo.isFaceScanned = false
-                }
+                photo.isFaceScanned = false
             }
             try? bgCtx.save()
             
-            // 🚨 KLUCZOWE: Synchronizacja z głównym kontekstem.
-            // SwiftData nie propaguje automatycznie zmian relacji (photo.people) z kontekstu
-            // tła do głównego kontekstu — ręcznie czyścimy zombie wpisy w UI.
             let capturedIDs = Array(affectedPhotoIDs)
             await MainActor.run {
                 let mainCtx = container.mainContext
                 for photoId in capturedIDs {
                     guard let mainPhoto: PhotoAsset = mainCtx.registeredModel(for: photoId) ?? (try? mainCtx.model(for: photoId)) as? PhotoAsset else { continue }
-                    // Usuń wszystkie "Osoba X" z photo.people w głównym kontekście
                     mainPhoto.people.removeAll { $0.name.hasPrefix("Osoba ") }
-                    if mainPhoto.faceCrops.isEmpty {
-                        mainPhoto.isFaceScanned = false
-                    }
+                    mainPhoto.isFaceScanned = false
                 }
                 try? mainCtx.save()
             }
@@ -316,7 +303,6 @@ struct PersonRow: View {
                 return
             }
             
-            // 🚨 OPTYMALIZACJA 1: Przenoszenie twarzy mniejszymi partiami (Batching zapobiegający zadyszce pamięci)
             let cropsToMove = Array(bgSource.faceCrops)
             var processed = 0
             for crop in cropsToMove {
@@ -325,25 +311,21 @@ struct PersonRow: View {
                 if processed % 500 == 0 { try? bgCtx.save() }
             }
             
-            // 🚨 OPTYMALIZACJA 2: Odwrócenie ról dla zdjęć (O(1) zamiast O(N^2))
             let targetPhotoIDs = Set(bgTarget.photos.map { $0.persistentModelID })
             let photosToMove = Array(bgSource.photos)
             
             processed = 0
             for photo in photosToMove {
                 if !targetPhotoIDs.contains(photo.persistentModelID) {
-                    // Dodajemy Osobę do małej tablicy przy Zdjęciu (zamiast Zdjęcia do gigantycznej tablicy u Osoby)
                     photo.people.append(bgTarget)
                 }
                 processed += 1
                 if processed % 500 == 0 { try? bgCtx.save() }
             }
             
-            // 3. Przeniesienie licznika
             bgTarget.faceCount += bgSource.faceCount
             bgSource.faceCount = 0
             
-            // 4. Skasowanie starej osoby
             bgCtx.delete(bgSource)
             try? bgCtx.save()
             
@@ -708,13 +690,11 @@ struct PersonDetailWorkspace: View {
         }
         person.faceCount = max(0, person.faceCount - count)
         
-        // 🚨 Jeśli po usunięciu zdjęcie nie ma już ŻADNEJ wykrytej twarzy, cofamy flagę "skanowania".
-        // Dzięki temu program nie będzie już fałszywie ostrzegał "znaleziono 0 twarzy" przy ponownym
-        // skanie - potraktuje takie zdjęcie tak, jakby nigdy nie było skanowane w poszukiwaniu twarzy.
+        // 🚨 POPRAWKA: Zawsze resetujemy flagę "isFaceScanned" na false dla zdjęć, z których usunięto twarze,
+        // bez względu na to czy zostały na nich jeszcze jakieś twarze. Dzięki temu kolejny skan przyrostowy
+        // zidentyfikuje brakującą osobę i doda ją z powrotem.
         for photo in affectedPhotos {
-            if photo.faceCrops.isEmpty {
-                photo.isFaceScanned = false
-            }
+            photo.isFaceScanned = false
         }
         
         try? modelContext.save()

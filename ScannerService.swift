@@ -6,6 +6,51 @@ import SwiftData
 import AppKit
 import Vision
 
+// =====================================================================
+// LOGGER SKANOWANIA TWARZY
+// =====================================================================
+class FaceScanLogger {
+    static let shared = FaceScanLogger()
+    private var fileHandle: FileHandle?
+    private let queue = DispatchQueue(label: "com.facescan.logger")
+    
+    private init() {
+        if let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first {
+            let logURL = desktopURL.appendingPathComponent("AIPhotoManager_FaceScan_Log.txt")
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            fileHandle = try? FileHandle(forWritingTo: logURL)
+            fileHandle?.seekToEndOfFile()
+        }
+        log("\n\n=======================================================")
+        log("🚀 NOWA SESJA SKANOWANIA TWARZY: \(Date())")
+        log("=======================================================")
+    }
+    
+    func log(_ message: String) {
+        queue.async {
+            let msg = "[\(Date())] \(message)\n"
+            self.fileHandle?.write(msg.data(using: .utf8) ?? Data())
+            print(msg, terminator: "")
+        }
+    }
+}
+
+private struct MainCluster {
+    let person: Person
+    var centroidVector: [Double]
+    var count: Int
+    
+    mutating func addFaceAndRecalculate(newVector: [Double]) {
+        let total = Double(count)
+        for i in 0..<centroidVector.count {
+            centroidVector[i] = (centroidVector[i] * total + newVector[i]) / (total + 1.0)
+        }
+        count += 1
+    }
+}
+
 actor ScannerService {
     
     var cancelRequested = false
@@ -15,8 +60,7 @@ actor ScannerService {
     }
     
     // =====================================================================
-    // 0. NAPRAWA BAZY: USUWANIE "ZOMBIE" TAGÓW OSÓB (np. stare "Osoba 3" wpisane
-    //    kiedyś na stałe do keywords, mimo że twarz została później usunięta/scalona)
+    // 0. NAPRAWA BAZY: USUWANIE "ZOMBIE" TAGÓW OSÓB
     // =====================================================================
     func cleanupZombiePersonKeywords(container: ModelContainer, onProgress: @escaping @Sendable (Int, Int, String) -> Void) async {
         let context = ModelContext(container)
@@ -30,16 +74,12 @@ actor ScannerService {
         var cleanedCount = 0
         var affectedPhotoIDs: [PersistentIdentifier] = []
         
-        // Regex dopasowujący automatycznie wygenerowane nazwy typu "Osoba 12"
         let regex = try? NSRegularExpression(pattern: "^Osoba \\d+$")
         
         for photo in allPhotos {
             if cancelRequested { break }
             var changed = false
             
-            // 1. Usuń WSZYSTKIE "Osoba X" z photo.keywords — tagi osób są przechowywane
-            //    WYŁĄCZNIE przez relację photo.people, nigdy przez tablicę keywords.
-            //    Stare wpisy "Osoba X" w keywords to zombie z poprzedniej wersji kodu.
             if !photo.keywords.isEmpty {
                 let before = photo.keywords.count
                 photo.keywords = photo.keywords.filter { kw in
@@ -52,9 +92,6 @@ actor ScannerService {
                 }
             }
             
-            // 2. Usuń zombie wpisy z photo.people — osoby "Osoba X", które nie mają
-            //    żadnego FaceCrop powiązanego z tym konkretnym zdjęciem (stare relacje
-            //    po usunięciu/scaleniu osób, które nie zostały posprzątane).
             let stalePersons = photo.people.filter { person in
                 guard person.name.hasPrefix("Osoba ") else { return false }
                 return !person.faceCrops.contains(where: { $0.photo?.persistentModelID == photo.persistentModelID })
@@ -78,22 +115,17 @@ actor ScannerService {
         }
         try? context.save()
         
-        // 🚨 KLUCZOWE: Synchronizacja z głównym kontekstem.
-        // SwiftData nie propaguje automatycznie zmian tablicowych z kontekstu tła
-        // do głównego kontekstu — robimy to ręcznie dla każdego zmodyfikowanego zdjęcia.
         let capturedIDs = affectedPhotoIDs
         await MainActor.run {
             let mainCtx = container.mainContext
             let rx = try? NSRegularExpression(pattern: "^Osoba \\d+$")
             for photoId in capturedIDs {
                 guard let mainPhoto: PhotoAsset = mainCtx.registeredModel(for: photoId) ?? (try? mainCtx.model(for: photoId)) as? PhotoAsset else { continue }
-                // Sync keywords
                 if !mainPhoto.keywords.isEmpty, let rxNN = rx {
                     mainPhoto.keywords = mainPhoto.keywords.filter { kw in
                         rxNN.firstMatch(in: kw, range: NSRange(kw.startIndex..., in: kw)) == nil
                     }
                 }
-                // Sync photo.people — usuń zombie "Osoba X"
                 mainPhoto.people.removeAll { p in
                     guard p.name.hasPrefix("Osoba ") else { return false }
                     return !p.faceCrops.contains(where: { $0.photo?.persistentModelID == mainPhoto.persistentModelID })
@@ -104,26 +136,6 @@ actor ScannerService {
         
         let finalCleaned = cleanedCount
         await MainActor.run { onProgress(total, total, "✅ Gotowe! Naprawiono \(finalCleaned) zdjęć.") }
-    }
-    
-    private class Cluster {
-        let person: Person
-        var centroidVector: [Double]
-        var count: Int
-        
-        init(person: Person, initialVector: [Double]) {
-            self.person = person
-            self.centroidVector = initialVector
-            self.count = 1
-        }
-        
-        func addFaceAndRecalculate(newVector: [Double]) {
-            let total = Double(count)
-            for i in 0..<centroidVector.count {
-                centroidVector[i] = (centroidVector[i] * total + newVector[i]) / (total + 1.0)
-            }
-            count += 1
-        }
     }
     
     private struct FaceResponse: Codable {
@@ -240,8 +252,6 @@ actor ScannerService {
             }
         }.value
         
-        // Z racji że PhotoAsset inicjuje self.id za pomocą UUID.deterministic(from: originalPath), 
-        // poniższy obiekt będzie miał dokładnie id = deterministicId
         let photo = PhotoAsset(fileName: fileName, originalPath: path)
         context.insert(photo)
         
@@ -282,7 +292,6 @@ actor ScannerService {
         }
     }
     
-    // --- BRAMKA BEZPIECZEŃSTWA: Czekanie na Pythona ---
     private func waitForPythonServer(onProgress: @escaping @Sendable (Int, Int, String) -> Void) async -> Bool {
         guard let url = URL(string: "http://127.0.0.1:8000/extract") else { return false }
         var request = URLRequest(url: url)
@@ -312,183 +321,302 @@ actor ScannerService {
     }
     
     // =====================================================================
-    // 2. NOWY SILNIK TWARZY Z WYSOKĄ ROZDZIELCZOŚCIĄ 1024PX I ŁAGODNYM FILTREM
+    // 2. NOWY SILNIK TWARZY Z WYSOKĄ ROZDZIELCZOŚCIĄ I ARCHITEKTURĄ HYBRYDOWĄ
     // =====================================================================
     func scanFaces(photoIDs: [PersistentIdentifier], container: ModelContainer, forceOverwrite: Bool = false, onProgress: @escaping @Sendable (Int, Int, String) -> Void) async {
+        FaceScanLogger.shared.log("Uruchamiam procedurę skanowania. Tryb wymuszonego nadpisania: \(forceOverwrite). Liczba zdjęć w kolejce: \(photoIDs.count)")
+        
         let isServerUp = await waitForPythonServer(onProgress: onProgress)
         if !isServerUp {
+            FaceScanLogger.shared.log("❌ Błąd krytyczny: Silnik AI nie wystartował! Zamykam procedurę.")
             await MainActor.run { onProgress(0, 0, "❌ Błąd: Silnik AI nie wystartował!") }
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             return
         }
         
-        let context = ModelContext(container)
-        context.autosaveEnabled = false
-        var clusters: [Cluster] = []
-        
-        let peopleList: [Person] = (try? context.fetch(FetchDescriptor<Person>())) ?? []
-        for person in peopleList {
-            let personFaces = person.faceCrops.compactMap { crop -> [Double]? in
-                guard let data = crop.featurePrintData else { return nil }
-                return try? JSONDecoder().decode([Double].self, from: data)
-            }
-            if !personFaces.isEmpty {
-                var sumVector = personFaces[0]
-                for i in 1..<personFaces.count {
-                    let vec = personFaces[i]
-                    for j in 0..<sumVector.count { sumVector[j] += vec[j] }
+        // Budowanie klastrów bezpośrednio z głównego wątku (gwarancja braku opóźnień)
+        var clusters = await MainActor.run { () -> [MainCluster] in
+            let mainCtx = container.mainContext
+            let peopleList: [Person] = (try? mainCtx.fetch(FetchDescriptor<Person>())) ?? []
+            var loaded: [MainCluster] = []
+            for person in peopleList {
+                let personFaces = person.faceCrops.compactMap { crop -> [Double]? in
+                    guard let data = crop.featurePrintData else { return nil }
+                    return try? JSONDecoder().decode([Double].self, from: data)
                 }
-                for j in 0..<sumVector.count { sumVector[j] /= Double(personFaces.count) }
-                clusters.append(Cluster(person: person, initialVector: sumVector))
+                if !personFaces.isEmpty {
+                    var sumVector = personFaces[0]
+                    for i in 1..<personFaces.count {
+                        let vec = personFaces[i]
+                        for j in 0..<sumVector.count { sumVector[j] += vec[j] }
+                    }
+                    for j in 0..<sumVector.count { sumVector[j] /= Double(personFaces.count) }
+                    loaded.append(MainCluster(person: person, centroidVector: sumVector, count: personFaces.count))
+                }
             }
+            FaceScanLogger.shared.log("Zbudowano klastry. Znanych profili osób w bazie: \(loaded.count)")
+            return loaded
         }
         
         let total = photoIDs.count
         var done = 0
-        var personCounter = peopleList.count + 1
+        var personCounter = clusters.count + 1
         
         for pid in photoIDs {
-            if cancelRequested { break }
+            if cancelRequested { 
+                FaceScanLogger.shared.log("⏹ Skanowanie anulowane przez użytkownika.")
+                break 
+            }
             await Task.yield()
-            var processedThisLoop = false
             
-            if let photo = getPhotoAsset(pid: pid, context: context), (!photo.isFaceScanned || forceOverwrite) && !photo.isTrash {
-                processedThisLoop = true
-                let fName = photo.fileName
-                let cDone = done
-                await MainActor.run { onProgress(cDone, total, "Twarze: \(fName)") }
+            // 1. Sprawdzanie i ewentualne czyszczenie na głównym wątku (MainActor)
+            struct PhotoPrep {
+                let path: String
+                let fileName: String
+                let isFaceScanned: Bool
+                let isTrash: Bool
+                let existingCropsVectors: [[Double]]
+            }
+            
+            let prep = await MainActor.run { () -> PhotoPrep? in
+                let mainCtx = container.mainContext
+                guard let photo = try? mainCtx.model(for: pid) as? PhotoAsset else { return nil }
                 
+                // Jeśli wymuszamy nadpisanie (forceOverwrite), usuwamy dotychczasowe powiązania twarzy
                 if forceOverwrite && photo.isFaceScanned {
+                    FaceScanLogger.shared.log("🧹 Wymuszone nadpisanie - czyszczenie starych danych twarzy dla \(photo.fileName).")
                     let oldCrops = Array(photo.faceCrops)
                     let oldPeople = Array(photo.people)
-                    // 🚨 KRYTYCZNA POPRAWKA: Musimy JAWNIE usunąć crop z tablicy person.faceCrops
-                    // przed wywołaniem context.delete(). SwiftData nie aktualizuje relacji odwrotnej
-                    // natychmiast w pamięci — crop zostaje "zombie" w person.faceCrops, przez co
-                    // nowe twarze są dokładane do starej (niepustej) tablicy zamiast ją zastąpić.
                     for crop in oldCrops {
                         if let person = crop.person {
                             person.faceCount = max(0, person.faceCount - 1)
                             person.faceCrops.removeAll { $0.id == crop.id }
+                            
+                            // Czyścimy puste profile generowane automatycznie ("Osoba X")
+                            if person.faceCount == 0 && person.name.hasPrefix("Osoba ") {
+                                mainCtx.delete(person)
+                            }
                         }
-                        context.delete(crop)
+                        mainCtx.delete(crop)
                     }
-                    // Usuń odwrotne powiązania zdjęcia z osobami
                     for person in oldPeople {
                         person.photos.removeAll { $0.id == photo.id }
                     }
                     photo.faceCrops.removeAll()
                     photo.people.removeAll()
-                }
-                
-                // 🚨 Generujemy obraz 1024px specjalnie pod kątem wykrywania małych twarzy
-                let fileURL = URL(fileURLWithPath: photo.originalPath)
-                if let highResData = ScannerService.generateThumbnail(for: fileURL, maxPixelSize: 1024) {
-                    
-                    if let facesData = await extractFacesFromPythonAPI(imageData: highResData) {
-                        for face in facesData {
-                            let width = face.bbox[2] - face.bbox[0]
-                            let height = face.bbox[3] - face.bbox[1]
-                            
-                            // 🚨 ZBALANSOWANY FILTR: Odrzucamy śmieciowe mikro-detekcje (fałszywe alarmy),
-                            // ale wciąż przepuszczamy rozsądnie małe twarze i lekkie profile.
-                            if width < 16 || height < 16 { continue }
-                            if let score = face.score, score < 0.5 { continue }
-                            
-                            let cropData = ScannerService.cropImage(from: highResData, bbox: face.bbox)
-                            let dnaData = try? JSONEncoder().encode(face.embedding)
-                            
-                            let faceCrop = FaceCrop(cropData: cropData ?? highResData, featurePrintData: dnaData)
-                            // 🚨 KLUCZOWA KOLEJNOŚĆ: context.insert() MUSI być PRZED ustawieniem relacji!
-                            // SwiftData śledzi zmiany relacji TYLKO na obiektach już wstawionych do kontekstu.
-                            // Ustawienie faceCrop.photo przed insertem powoduje że crop.photo = NIL w bazie.
-                            context.insert(faceCrop)
-                            faceCrop.photo = photo
-                            photo.faceCrops.append(faceCrop)
-                            
-                            var bestMatch: Cluster? = nil
-                            var minDistance: Double = .greatestFiniteMagnitude
-                            let currentVector = face.embedding
-                            
-                            for cluster in clusters {
-                                let distance = ScannerService.cosineDistance(currentVector, cluster.centroidVector)
-                                if distance < 0.65 && distance < minDistance {
-                                    minDistance = distance
-                                    bestMatch = cluster
-                                }
-                            }
-                            
-                            if let match = bestMatch {
-                                faceCrop.person = match.person
-                                match.person.faceCrops.append(faceCrop)
-                                match.person.faceCount += 1
-                                if !match.person.photos.contains(photo) { match.person.photos.append(photo) }
-                                if !photo.people.contains(match.person) { photo.people.append(match.person) }
-                                match.addFaceAndRecalculate(newVector: currentVector)
-                            } else {
-                                let newPerson = Person(name: "Osoba \(personCounter)")
-                                newPerson.faceCount = 1
-                                context.insert(newPerson)
-                                faceCrop.person = newPerson
-                                newPerson.faceCrops.append(faceCrop)
-                                newPerson.photos.append(photo)
-                                photo.people.append(newPerson)
-                                clusters.append(Cluster(person: newPerson, initialVector: currentVector))
-                                personCounter += 1
-                            }
-                        }
-                        photo.isFaceScanned = true
-                    } else {
-                        await MainActor.run { onProgress(cDone, total, "⚠️ Serwer zawieszony. Reanimacja...") }
-                        await MainActor.run { PythonBackendManager.shared.startServer() }
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    }
-                } else {
-                    photo.isFaceScanned = true
-                }
-                
-                // Zapisz background context, żeby relacje trafiły do SQLite
-                try? context.save()
-                
-                // 🚨 KLUCZOWE: Jawnie aktualizujemy relacje w GŁÓWNYM kontekście.
-                // SwiftData nie propaguje automatycznie zmian relacji (person.photos, photo.people)
-                // z tła do głównego kontekstu. Musimy to zrobić ręcznie, żeby tagi Osób
-                // pozostawały widoczne po nawigacji (a nie znikały po chwili).
-                let photoId = photo.id
-                let updatedKeywords = photo.keywords
-                let personPIDs = photo.people.map { $0.persistentModelID }
-                
-                await MainActor.run {
-                    let mainCtx = container.mainContext
-                    guard let mainPhoto = self.getPhotoAsset(pid: pid, context: mainCtx) else {
-                        NotificationCenter.default.post(name: NSNotification.Name("AIPhotoUpdated"), object: photoId)
-                        return
-                    }
-                    mainPhoto.isFaceScanned = true
-                    mainPhoto.keywords = updatedKeywords
-                    
-                    // Jawnie linkujemy każdą Osobę z tym Zdjęciem w głównym kontekście
-                    for personPID in personPIDs {
-                        let mainPerson: Person? = mainCtx.registeredModel(for: personPID) ?? (try? mainCtx.model(for: personPID)) as? Person
-                        if let p = mainPerson {
-                            if !mainPhoto.people.contains(p) { mainPhoto.people.append(p) }
-                            if !p.photos.contains(mainPhoto) { p.photos.append(mainPhoto) }
-                        }
-                    }
                     try? mainCtx.save()
-                    NotificationCenter.default.post(name: NSNotification.Name("AIPhotoUpdated"), object: photoId)
+                }
+                
+                let cropsDna = photo.faceCrops.compactMap { crop -> [Double]? in
+                    guard let data = crop.featurePrintData else { return nil }
+                    return try? JSONDecoder().decode([Double].self, from: data)
+                }
+                
+                return PhotoPrep(
+                    path: photo.originalPath,
+                    fileName: photo.fileName,
+                    isFaceScanned: photo.isFaceScanned,
+                    isTrash: photo.isTrash,
+                    existingCropsVectors: cropsDna
+                )
+            }
+            
+            guard let photoPrep = prep else {
+                FaceScanLogger.shared.log("⚠️ Pomięto zdjęcie ID \(pid) - nie odnaleziono w bazie.")
+                continue
+            }
+            if (photoPrep.isFaceScanned && !forceOverwrite) || photoPrep.isTrash {
+                FaceScanLogger.shared.log("⏭️ Pominięto zdjęcie: \(photoPrep.fileName) (Już przeskanowane lub znajduje się w koszu).")
+                done += 1
+                continue
+            }
+            
+            let fName = photoPrep.fileName
+            let cDone = done
+            
+            FaceScanLogger.shared.log("\n---------------------------------------------------")
+            FaceScanLogger.shared.log("📸 ANALIZA ZDJĘCIA: \(fName)")
+            
+            await MainActor.run { onProgress(cDone, total, "Twarze: \(fName)") }
+            
+            // 2. Kosztowna generacja miniatury w tle (poza MainActor)
+            let fileURL = URL(fileURLWithPath: photoPrep.path)
+            
+            FaceScanLogger.shared.log("Sprawdzam dostęp do pliku: \(photoPrep.path)")
+            if !FileManager.default.fileExists(atPath: photoPrep.path) {
+                FaceScanLogger.shared.log("❌ BŁĄD: Plik fizycznie nie istnieje na dysku!")
+            } else if !FileManager.default.isReadableFile(atPath: photoPrep.path) {
+                FaceScanLogger.shared.log("❌ BŁĄD: Plik istnieje, ale aplikacja nie ma do niego uprawnień odczytu (Brak dostępu App Sandbox / Zgubione Zakładki).")
+            }
+            
+            var finalImageData: Data? = ScannerService.generateThumbnail(for: fileURL, maxPixelSize: 1024)
+            
+            if finalImageData == nil {
+                FaceScanLogger.shared.log("⚠️ Metoda generateThumbnail zawiodła. Próba awaryjnego odczytu przez NSImage...")
+                if let image = NSImage(contentsOf: fileURL),
+                   let tiff = image.tiffRepresentation,
+                   let bitmap = NSBitmapImageRep(data: tiff),
+                   let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) {
+                    finalImageData = jpeg
+                    FaceScanLogger.shared.log("✅ Odczyt awaryjny zakończony sukcesem (\(jpeg.count) bajtów).")
                 }
             }
             
-            done += 1
-            if done % 250 == 0 || done == total {
-                try? context.save()
-                if !processedThisLoop {
-                    let cDone = done
-                    await MainActor.run { onProgress(cDone, total, "Szybkie sprawdzanie: \(cDone)/\(total)") }
+            guard let highResData = finalImageData else {
+                FaceScanLogger.shared.log("❌ Krytyczny błąd: Całkowity brak możliwości wczytania obrazu dla \(fName). Oznaczam jako sprawdzone, aby nie zapętlać błędu.")
+                await MainActor.run {
+                    let mainCtx = container.mainContext
+                    if let photo = try? mainCtx.model(for: pid) as? PhotoAsset {
+                        photo.isFaceScanned = true
+                        try? mainCtx.save()
+                    }
                 }
+                done += 1
+                continue
             }
+            
+            // 3. Połączenie z API Pythona w tle (poza MainActor)
+            FaceScanLogger.shared.log("Wysyłam zapytanie do serwera AI (\(highResData.count) bajtów)...")
+            guard let facesData = await extractFacesFromPythonAPI(imageData: highResData) else {
+                FaceScanLogger.shared.log("❌ BŁĄD API: Python nie odpowiedział dla \(fName). Reanimacja serwera...")
+                await MainActor.run { onProgress(cDone, total, "⚠️ Serwer zawieszony. Reanimacja...") }
+                await MainActor.run { PythonBackendManager.shared.startServer() }
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                done += 1
+                continue
+            }
+            
+            FaceScanLogger.shared.log("✅ Odpowiedź z serwera AI. Liczba wykrytych obiektów: \(facesData.count)")
+
+            // 4. Aktualizacja bazy danych w 100% na głównym wątku (gwarancja natychmiastowej spójności)
+            await MainActor.run {
+                let mainCtx = container.mainContext
+                guard let photo = try? mainCtx.model(for: pid) as? PhotoAsset else { return }
+                
+                var processedFaces = 0
+                for face in facesData {
+                    let width = face.bbox[2] - face.bbox[0]
+                    let height = face.bbox[3] - face.bbox[1]
+                    
+                    if width < 16 || height < 16 {
+                        FaceScanLogger.shared.log("   -> Odrzucono twarz (Zbyt mała: \(width)x\(height)px)")
+                        continue 
+                    }
+                    if let score = face.score, score < 0.5 {
+                        FaceScanLogger.shared.log("   -> Odrzucono twarz (Niski współczynnik pewności AI: \(score))")
+                        continue 
+                    }
+                    
+                    let currentVector = face.embedding
+                    
+                    // Bezpieczny skan przyrostowy: sprawdzamy czy ta twarz jest już obecna w pliku
+                    var isAlreadyPresent = false
+                    for existingVector in photoPrep.existingCropsVectors {
+                        let dist = ScannerService.cosineDistance(currentVector, existingVector)
+                        if dist < 0.1 {
+                            isAlreadyPresent = true
+                            break
+                        }
+                    }
+                    
+                    if isAlreadyPresent {
+                        FaceScanLogger.shared.log("   -> Twarz na koordynatach \(face.bbox) została uznana za duplikat i pominięta.")
+                        continue
+                    }
+                    
+                    processedFaces += 1
+                    let cropData = ScannerService.cropImage(from: highResData, bbox: face.bbox)
+                    let dnaData = try? JSONEncoder().encode(currentVector)
+                    
+                    let faceCrop = FaceCrop(cropData: cropData ?? highResData, featurePrintData: dnaData)
+                    mainCtx.insert(faceCrop)
+                    
+                    // 🚨 DWUSTRONNE PRZYPISANIE - zabezpiecza przed zgubieniem relacji
+                    faceCrop.photo = photo  
+                    if !photo.faceCrops.contains(where: { $0.id == faceCrop.id }) {
+                        photo.faceCrops.append(faceCrop)
+                    }
+                    
+                    // Szukamy najlepszego klastra (osoby)
+                    var bestMatchIndex: Int? = nil
+                    var minDistance: Double = .greatestFiniteMagnitude
+                    
+                    for (idx, cluster) in clusters.enumerated() {
+                        let distance = ScannerService.cosineDistance(currentVector, cluster.centroidVector)
+                        if distance < 0.65 && distance < minDistance {
+                            minDistance = distance
+                            bestMatchIndex = idx
+                        }
+                    }
+                    
+                    if let idx = bestMatchIndex {
+                        let matchedCluster = clusters[idx]
+                        let targetPerson = matchedCluster.person
+                        
+                        FaceScanLogger.shared.log("   -> 🎯 Znaleziono dopasowanie! Osoba: \(targetPerson.name) (Odległość wektora: \(minDistance))")
+                        
+                        // 🚨 DWUSTRONNE PRZYPISANIE
+                        faceCrop.person = targetPerson
+                        if !targetPerson.faceCrops.contains(where: { $0.id == faceCrop.id }) {
+                            targetPerson.faceCrops.append(faceCrop)
+                        }
+                        
+                        targetPerson.faceCount += 1
+                        
+                        if !photo.people.contains(where: { $0.id == targetPerson.id }) {
+                            photo.people.append(targetPerson)
+                            // Dodajemy relację zwrotną ręcznie
+                            if !targetPerson.photos.contains(where: { $0.id == photo.id }) {
+                                targetPerson.photos.append(photo)
+                            }
+                            FaceScanLogger.shared.log("      [+] Nowy tag: \(targetPerson.name) został pomyślnie przypięty do zdjęcia.")
+                        } else {
+                            FaceScanLogger.shared.log("      [=] Tag: \(targetPerson.name) był już przypięty do tego zdjęcia.")
+                        }
+                        
+                        clusters[idx].addFaceAndRecalculate(newVector: currentVector)
+                    } else {
+                        // Tworzymy nową unikalną osobę
+                        let newPerson = Person(name: "Osoba \(personCounter)")
+                        newPerson.faceCount = 1
+                        mainCtx.insert(newPerson)
+                        
+                        FaceScanLogger.shared.log("   -> ➕ Nie udało się dopasować twarzy (Najniższy dystans = \(minDistance)). Tworzę nową kartotekę: \(newPerson.name)")
+                        
+                        // 🚨 DWUSTRONNE PRZYPISANIE
+                        faceCrop.person = newPerson
+                        if !newPerson.faceCrops.contains(where: { $0.id == faceCrop.id }) {
+                            newPerson.faceCrops.append(faceCrop)
+                        }
+                        
+                        photo.people.append(newPerson)
+                        if !newPerson.photos.contains(where: { $0.id == photo.id }) {
+                            newPerson.photos.append(photo)
+                        }
+                        
+                        clusters.append(MainCluster(person: newPerson, centroidVector: currentVector, count: 1))
+                        personCounter += 1
+                    }
+                }
+                
+                photo.isFaceScanned = true
+                
+                do {
+                    try mainCtx.save()
+                    FaceScanLogger.shared.log("💾 ZAPIS ZAKOŃCZONY dla: \(photo.fileName). Skutecznie przydzielone tagi: \(photo.people.map { $0.name })")
+                } catch {
+                    FaceScanLogger.shared.log("❌ KRYTYCZNY BŁĄD BAZY DANYCH dla \(photo.fileName): \(error)")
+                }
+                
+                NotificationCenter.default.post(name: NSNotification.Name("AIPhotoUpdated"), object: photo.id)
+            }
+            
+            done += 1
         }
-        try? context.save()
+        
+        await MainActor.run {
+            onProgress(total, total, "Zakończono skanowanie twarzy!")
+        }
     }
     
     // =====================================================================
@@ -811,7 +939,8 @@ actor ScannerService {
     nonisolated static func generateThumbnail(for url: URL, maxPixelSize: Int) -> Data? {
         return autoreleasepool {
             let options: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+                // ZMIANA TUTAJ: Wymusza generowanie ze źródła, ignorując EXIF Thumbnail
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
                 kCGImageSourceShouldCacheImmediately: true,
                 kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
