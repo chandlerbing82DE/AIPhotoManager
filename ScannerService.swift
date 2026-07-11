@@ -463,11 +463,11 @@ actor ScannerService {
             }
             
             guard let highResData = finalImageData else {
-                FaceScanLogger.shared.log("❌ Krytyczny błąd: Całkowity brak możliwości wczytania obrazu dla \(fName). Oznaczam jako sprawdzone, aby nie zapętlać błędu.")
+                FaceScanLogger.shared.log("❌ Krytyczny błąd: Brak możliwości wczytania obrazu \(fName) (Prawdopodobnie dysk odłączony). Zostawiam jako NIESPRAWDZONE (isFaceScanned = false), aby spróbować ponownie przy następnym uruchomieniu.")
                 await MainActor.run {
                     let mainCtx = container.mainContext
                     if let photo = try? mainCtx.model(for: pid) as? PhotoAsset {
-                        photo.isFaceScanned = true
+                        photo.isFaceScanned = false // <--- ZMIENIONE Z TRUE NA FALSE
                         try? mainCtx.save()
                     }
                 }
@@ -713,7 +713,22 @@ actor ScannerService {
                 let cDone = done
                 await MainActor.run { onProgress(cDone, total, "Opisywanie AI: \(fName)") }
                 
-                if let highResData = ScannerService.generateThumbnail(for: URL(fileURLWithPath: photo.originalPath), maxPixelSize: 1200) {
+                let fileURL = URL(fileURLWithPath: photo.originalPath)
+                
+                // 1. Próba standardowego wygenerowania miniatury
+                var finalImageData = ScannerService.generateThumbnail(for: fileURL, maxPixelSize: 1200)
+                
+                // 2. AWARYJNY ODCZYT (Odporność na problemy z plikami ARW i siecią NAS)
+                if finalImageData == nil {
+                    if let image = NSImage(contentsOf: fileURL),
+                       let tiff = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiff),
+                       let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) {
+                        finalImageData = jpeg
+                    }
+                }
+                
+                if let highResData = finalImageData {
                     do {
                         let hasVIP = photo.people.contains(where: { $0.isTop100 })
                         let response = try await fetchGeminiDescription(imageData: highResData, apiKey: apiKey, hasVIP: hasVIP)
@@ -749,6 +764,8 @@ actor ScannerService {
                     } catch {
                         print("❌ Błąd Gemini dla \(photo.fileName): \(error)")
                     }
+                } else {
+                    print("❌ Krytyczny błąd: Nie udało się wczytać obrazu dla AI: \(photo.fileName)")
                 }
             }
             done += 1

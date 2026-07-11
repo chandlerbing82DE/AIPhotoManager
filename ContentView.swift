@@ -391,7 +391,11 @@ struct ContentView: View {
 
     var body: some View {
         mainContent
-        .onAppear { autoEmptyTrash(); loadPhotosFromDatabase() }
+        .onAppear { 
+            autoEmptyTrash()
+            loadPhotosFromDatabase()
+            NASWatchdog.shared.start() // Uruchomienie strażnika NAS po włączeniu aplikacji!
+        }
         .onChange(of: selectedNavItems) { _, _ in loadPhotosFromDatabase() }
         .onChange(of: activeSearchText) { _, newVal in
             if !newVal.isEmpty { navigateToMainIfOnSpecialView() }
@@ -615,10 +619,6 @@ struct ContentView: View {
                         let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash && !$0.isFaceScanned }
                         if !toScan.isEmpty { requestFaceScan(photos: toScan, force: false) }
                     }
-                    Button("Napraw pominięte (Brak twarzy)") {
-                        let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash && $0.isFaceScanned && $0.faceCrops.isEmpty }
-                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
-                    }
                     Button("Skanuj WSZYSTKO (Nadpisz)") {
                         let toScan = folder.photosRecursively(limit: 999999).filter { !$0.isTrash }
                         if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
@@ -650,10 +650,6 @@ struct ContentView: View {
                     Button("Tylko brakujące") {
                         let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash && !$0.isFaceScanned }
                         if !toScan.isEmpty { requestFaceScan(photos: toScan, force: false) }
-                    }
-                    Button("Napraw pominięte (Brak twarzy)") {
-                        let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash && $0.isFaceScanned && $0.faceCrops.isEmpty }
-                        if !toScan.isEmpty { requestFaceScan(photos: toScan, force: true) }
                     }
                     Button("Skanuj WSZYSTKO (Nadpisz)") {
                         let toScan = event.photosRecursively(limit: 999999).filter { !$0.isTrash }
@@ -814,7 +810,7 @@ struct WorkspaceView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button(action: { showingBackupSheet = true }) { Label("Kopia zapasowa", systemImage: "archivebox") }.disabled(jobState.isActive).help("Wykonaj kopię zapasową całego systemu")
-                    Button(action: onAISettingsToolbar) { Label("Ustawienia AI", systemImage: "cpu") }.disabled(jobState.isActive).help("Panel klucza API")
+                    Button(action: onAISettingsToolbar) { Label("Ustawienia", systemImage: "gearshape") }.disabled(jobState.isActive).help("Panel klucza API i sieci NAS")
                     Button(action: onImportFolder) { Label("Importuj folder", systemImage: "folder.badge.plus") }.disabled(jobState.isActive).help("Importuj folder")
                     Button(action: onAIGlobalToolbar) { Label("Opisz wszystkie (AI)", systemImage: "wand.and.stars.inverse") }.disabled(jobState.isActive).help("Opisy, oceny i tagi AI")
                     Button(action: onScanCleanupToolbar) { Label("Skanuj porządkowo", systemImage: "eraser") }.disabled(jobState.isActive).help("Skanuj duplikaty i dokumenty")
@@ -828,30 +824,72 @@ struct WorkspaceView: View {
             .sheet(isPresented: $showingBackupSheet) { BackupSheetView() }
             .alert("Nowe wydarzenie", isPresented: $showingNewEventAlert) { TextField("Nazwa wydarzenia", text: $newEventName); Button("Anuluj", role: .cancel) { }; Button("Utwórz i przenieś") { guard !newEventName.isEmpty, !selectedPhotos.isEmpty else { return }; let newEvent = EventFolder(name: newEventName, generatedAutomatically: false); modelContext.insert(newEvent); for photo in selectedPhotos { photo.event = newEvent }; try? modelContext.save(); selectedNavItems = [.event(newEvent)]; selectedPhotos.removeAll() } }
             .alert("Kreator Opisów AI", isPresented: $showingGlobalAIAlert) {
-                Button("Tylko brakujące") { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isAiScanned == false && $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanAI(toScan, false) } else { jobState.progressStatus = "✅ Brak nowych zdjęć do opisu!"; jobState.isScanning = true; Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false } } }
-                Button("Skanuj WSZYSTKO", role: .destructive) { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanAI(toScan, true) } }
+                Button("Tylko brakujące") { 
+                    if let allPhotos = try? modelContext.fetch(FetchDescriptor<PhotoAsset>()) {
+                        let toScan = allPhotos.filter { !$0.isTrash && !$0.isAiScanned }
+                        if !toScan.isEmpty {
+                            onScanAI(toScan, false)
+                        } else {
+                            jobState.progressStatus = "✅ Brak nowych zdjęć do opisu!"
+                            jobState.isScanning = true
+                            Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false }
+                        }
+                    }
+                }
+                Button("Skanuj WSZYSTKO", role: .destructive) { 
+                    if let allPhotos = try? modelContext.fetch(FetchDescriptor<PhotoAsset>()) {
+                        let toScan = allPhotos.filter { !$0.isTrash }
+                        if !toScan.isEmpty {
+                            onScanAI(toScan, true)
+                        }
+                    }
+                }
                 Button("Anuluj", role: .cancel) { }
             } message: { Text("Wybierz tryb pracy sztucznej inteligencji. Pomiń zdjęcia, które już wczytały opisy z plików .xmp.") }
             .alert("Kreator Skanowania Twarzy", isPresented: $showingGlobalFacesAlert) {
-                Button("Tylko brakujące") { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isFaceScanned == false && $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanFaces(toScan, false) } else { jobState.progressStatus = "✅ Wszystkie zdjęcia już przeskanowane!"; jobState.isScanning = true; Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false } } }
-                Button("Napraw pominięte (Brak twarzy)") {
-                    jobState.progressStatus = "Wyszukiwanie pominiętych..."
-                    jobState.isScanning = true
-                    Task { @MainActor in
-                        let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isFaceScanned == true && $0.isTrash == false })
-                        let allScanned = (try? modelContext.fetch(desc)) ?? []
-                        let toScan = allScanned.filter { $0.faceCrops.isEmpty }
-                        jobState.isScanning = false
-                        if !toScan.isEmpty { onScanFaces(toScan, true) }
-                        else { jobState.progressStatus = "✅ Brak pominiętych zdjęć!"; jobState.isScanning = true; try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false }
+                Button("Tylko brakujące") { 
+                    if let allPhotos = try? modelContext.fetch(FetchDescriptor<PhotoAsset>()) {
+                        let toScan = allPhotos.filter { !$0.isTrash && !$0.isFaceScanned }
+                        if !toScan.isEmpty {
+                            onScanFaces(toScan, false)
+                        } else {
+                            jobState.progressStatus = "✅ Wszystkie zdjęcia już przeskanowane!"
+                            jobState.isScanning = true
+                            Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false }
+                        }
                     }
                 }
-                Button("Skanuj WSZYSTKO (Nadpisz)", role: .destructive) { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanFaces(toScan, true) } }
+                Button("Skanuj WSZYSTKO (Nadpisz)", role: .destructive) { 
+                    if let allPhotos = try? modelContext.fetch(FetchDescriptor<PhotoAsset>()) {
+                        let toScan = allPhotos.filter { !$0.isTrash }
+                        if !toScan.isEmpty {
+                            onScanFaces(toScan, true)
+                        }
+                    }
+                }
                 Button("Anuluj", role: .cancel) { }
-            } message: { Text("Wybierz tryb pracy skanera. Możesz skanować nowe, nadpisać wszystko, albo naprawić zdjęcia omyłkowo pominięte przez filtry.") }
+            } message: { Text("Wybierz tryb pracy skanera twarzy. Możesz skanować tylko nowe lub nadpisać wszystko.") }
             .alert("Kreator Porządkowania", isPresented: $showingCleanupAlert) {
-                Button("Tylko nieskanowane") { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isReviewScanned == false && $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanCleanup(toScan) } else { jobState.progressStatus = "✅ Baza jest w pełni uporządkowana!"; jobState.isScanning = true; Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false } } }
-                Button("Wymuś pełny skan", role: .destructive) { let desc = FetchDescriptor<PhotoAsset>(predicate: #Predicate<PhotoAsset> { $0.isTrash == false }); if let toScan = try? modelContext.fetch(desc), !toScan.isEmpty { onScanCleanup(toScan) } }
+                Button("Tylko nieskanowane") { 
+                    if let allPhotos = try? modelContext.fetch(FetchDescriptor<PhotoAsset>()) {
+                        let toScan = allPhotos.filter { !$0.isTrash && !$0.isReviewScanned }
+                        if !toScan.isEmpty {
+                            onScanCleanup(toScan)
+                        } else {
+                            jobState.progressStatus = "✅ Baza jest w pełni uporządkowana!"
+                            jobState.isScanning = true
+                            Task { try? await Task.sleep(nanoseconds: 3_000_000_000); jobState.isScanning = false }
+                        }
+                    }
+                }
+                Button("Wymuś pełny skan", role: .destructive) { 
+                    if let allPhotos = try? modelContext.fetch(FetchDescriptor<PhotoAsset>()) {
+                        let toScan = allPhotos.filter { !$0.isTrash }
+                        if !toScan.isEmpty {
+                            onScanCleanup(toScan)
+                        }
+                    }
+                }
                 Button("Anuluj", role: .cancel) { }
             } message: { Text("Wybierz tryb porządkowania bazy.") }
             .task { checkDatabaseState() }
